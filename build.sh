@@ -1,6 +1,19 @@
 #!/bin/bash
+set -euo pipefail
 
-set -e
+mkdir -p third_party
 
-gcc -O3 -Wall -Wextra -pthread -o tc358743_drm_present tc358743_drm_present.c -I/usr/include/libdrm -ldrm -lv4l2
-./tc358743_drm_present --bgr --edid /root/drm_overlay/720P60EDID.txt --v4l2-dev /dev/video0 --modeset=match-input --present=stretch --threads 4 --crosshair 50x50 --crosshair-color 255,255,255 --crosshair-thickness 1
+if [ ! -f third_party/httplib.h ]; then
+  echo "[build] fetching cpp-httplib..."
+  curl -L --fail -o third_party/httplib.h \
+    https://raw.githubusercontent.com/yhirose/cpp-httplib/v0.15.3/httplib.h
+fi
+
+echo "[build] compiling..."
+g++ -O3 -Wall -Wextra -pthread -std=c++17 \
+  -o tc358743_drm_present_webui \
+  tc358743_drm_present_webui.cpp \
+  -I/usr/include/libdrm -I./third_party \
+  -ldrm -lv4l2
+
+echo "[build] built: ./tc358743_drm_present_webui"

@@ -1,1 +1,94 @@
-{"v4l2Dev":"/dev/video0","edidPath":"","modesetMatchInput":true,"threads":3,"bgr":true,"present":"stretch","crosshairEnabled":true,"crosshairDiam":"50x50","crosshairCenter":"","crosshairMode":"solid","crosshairColor":"255,255,255","crosshairThickness":1}
+{
+  "v4l2Dev": "/dev/video0",
+  "edidPath": "/root/drm_overlay/720P60EDID.txt",
+  "modesetMatchInput": false,
+  "threads": 4,
+  "bgr": true,
+  "present": "fit",
+  "preferOutputMode": true,
+  "preferOutputRes": "1280x720",
+  "viewport": "1920x1080",
+  "listenAddr": "0.0.0.0",
+  "layers": [
+    {
+      "name": "Video0_TL",
+      "type": "video",
+      "enabled": true,
+      "opacity": 0.5,
+      "invertRel": "none",
+      "srcRect": "0,0,960,540",
+      "dstPos": "0,0",
+      "scale": "1,1",
+      "crosshair": {
+        "enabled": false,
+        "diam": "50x50",
+        "center": "",
+        "thickness": 1,
+        "mode": "solid",
+        "color": "255,255,255",
+        "opacity": 1,
+        "invertRel": "none"
+      }
+    },
+    {
+      "name": "Video0_TR",
+      "type": "video",
+      "enabled": true,
+      "opacity": 0.5,
+      "invertRel": "none",
+      "srcRect": "960,0,960,540",
+      "dstPos": "960,0",
+      "scale": "1,1",
+      "crosshair": {
+        "enabled": false,
+        "diam": "50x50",
+        "center": "",
+        "thickness": 1,
+        "mode": "solid",
+        "color": "255,255,255",
+        "opacity": 1,
+        "invertRel": "none"
+      }
+    },
+    {
+      "name": "Video0_BL",
+      "type": "video",
+      "enabled": true,
+      "opacity": 0.5,
+      "invertRel": "none",
+      "srcRect": "0,540,960,540",
+      "dstPos": "0,540",
+      "scale": "1,1",
+      "crosshair": {
+        "enabled": false,
+        "diam": "50x50",
+        "center": "",
+        "thickness": 1,
+        "mode": "solid",
+        "color": "255,255,255",
+        "opacity": 1,
+        "invertRel": "none"
+      }
+    },
+    {
+      "name": "Video0_BR",
+      "type": "video",
+      "enabled": true,
+      "opacity": 0.5,
+      "invertRel": "none",
+      "srcRect": "960,540,960,540",
+      "dstPos": "960,540",
+      "scale": "1,1",
+      "crosshair": {
+        "enabled": false,
+        "diam": "50x50",
+        "center": "",
+        "thickness": 1,
+        "mode": "solid",
+        "color": "255,255,255",
+        "opacity": 1,
+        "invertRel": "none"
+      }
+    }
+  ]
+}

@@ -5,16 +5,24 @@
 #include <vector>
 #include <sstream>
 #include <cstdio>
+
 #include "third_party/httplib.h"
 #include "tc358743_webui.h"
+
 static std::mutex g_mtx;
+
 static std::string (*g_cfg_json)() = nullptr;
 static bool (*g_apply)(const std::string&, std::string&, int&) = nullptr;
 static std::string (*g_status)() = nullptr;
 static std::string (*g_filter_defs)() = nullptr;
+
+// NEW: V4L2 caps provider
+static std::string (*g_v4l2_caps)(const std::string &dev) = nullptr;
+
 static std::atomic<bool> *g_quit = nullptr;
 static std::vector<uint8_t> g_ref_png;
 static std::string g_listen_addr = "0.0.0.0";
+
 void webui_set_config_json_provider(std::string (*fn)()) {
   std::lock_guard<std::mutex> lk(g_mtx);
   g_cfg_json = fn;
@@ -47,6 +55,13 @@ void webui_set_filter_defs_provider(std::string (*fn)()) {
 void webui_set_filters_provider(std::string (*fn)()) {
   webui_set_filter_defs_provider(fn);
 }
+
+// NEW: V4L2 caps provider setter
+void webui_set_v4l2_caps_provider(std::string (*fn)(const std::string &dev)) {
+  std::lock_guard<std::mutex> lk(g_mtx);
+  g_v4l2_caps = fn;
+}
+
 /*
   Notes re: per-layer filter stacks (video layers only for now):
   - UI stores filters as: layer.filters = [{id, enabled, params}, ...]
@@ -394,7 +409,6 @@ static const char *kIndexHtml = R"HTML(<!doctype html>
             </div>
           </div>
           <div class="hr"></div>
-
           <div id="videoInspector" style="display:none;">
             <div class="sectionTitle">Video layer</div>
             <div class="grid2">
@@ -439,7 +453,6 @@ static const char *kIndexHtml = R"HTML(<!doctype html>
             <div style="height:10px;"></div>
             <div id="filtersBox" class="fStack"></div>
           </div>
-
           <div id="crossInspector" style="display:none;">
             <div class="sectionTitle">Crosshair layer</div>
             <div class="grid2">
@@ -494,7 +507,6 @@ static const char *kIndexHtml = R"HTML(<!doctype html>
               that’s backend-side, not UI.
             </div>
           </div>
-
         </div>
       </div>
       <div style="height:12px;"></div>
@@ -508,7 +520,6 @@ static const char *kIndexHtml = R"HTML(<!doctype html>
     </div>
   </div>
 </div>
-
 <script>
 const LIMITS = {
   opacity: {min:0, max:1},
@@ -516,13 +527,11 @@ const LIMITS = {
   scale: {min:0.0001, max:64},
   dim: {min:1, max:16384},
 };
-
 function clamp(v, lo, hi){ return Math.min(hi, Math.max(lo, v)); }
 function isNum(x){ return typeof x === 'number' && isFinite(x); }
 function round(v){ return Math.round(v); }
 function fmt(v){ return (Math.round(v*10000)/10000).toString(); }
 function deepClone(o){ return JSON.parse(JSON.stringify(o)); }
-
 function parseDimWxH(s){
   if (!s) return null;
   const m = String(s).trim().match(/^(\d+)\s*[xX]\s*(\d+)$/);
@@ -563,7 +572,6 @@ function parseCSVStrings(s){
   if (!s) return [];
   return String(s).split(',').map(x => x.trim()).filter(x => x.length);
 }
-
 async function api(path, opts) {
   const r = await fetch(path, opts);
   const t = await r.text();
@@ -572,16 +580,13 @@ async function api(path, opts) {
   if (!r.ok) throw new Error(j.error || t);
   return j;
 }
-
 let cfg = null;
 let selectedIdx = -1;
 let runtime = null;
-
 let ui = {
   mode: 'select',
   crop: { active:false, rect:null, drag:null }
 };
-
 let stage = {
   vpw: 0,
   vph: 0,
@@ -590,22 +595,10 @@ let stage = {
   imgNaturalW: 0,
   imgNaturalH: 0,
 };
-
 let stageDrag = null;
-
 // Filter registry
 let filterDefs = null;
 
-/*
-  FIXES FOR SOBEL APPLY FAILURES:
-  - Make fallback schema match backend:
-      sobel.mode: edgesOnly|magnitude
-      sobel.alpha: float 0..1
-      sobel.invert: bool
-      sobel.threshold: int 0..255
-  - Allow backend /api/filters to return "params" as an object of defaults and still
-    synthesize a usable schema so the UI can coerce types correctly.
-*/
 const FILTER_FALLBACK = {
   filters: [
     {
@@ -627,7 +620,6 @@ const FILTER_FALLBACK = {
     }
   ]
 };
-
 function schemaForKnownFilterId(id){
   if (id === 'mono') return FILTER_FALLBACK.filters[0].params;
   if (id === 'sobel') return FILTER_FALLBACK.filters[1].params;
@@ -726,25 +718,20 @@ function ensureVideoFilterDefaults(L){
   });
   return L;
 }
-
 function ensureLayerDefaults(L){
   if (!L.name) L.name = "Layer";
   if (!L.type) L.type = "video";
   if (L.enabled === undefined) L.enabled = true;
   if (!isNum(L.opacity)) L.opacity = 1.0;
   if (!L.invertRel) L.invertRel = "none";
-
-  // NEW: per-video-layer videoSource
   if (L.type === 'video') {
     if (L.videoSource === undefined) L.videoSource = "";
     if (typeof L.videoSource !== 'string') L.videoSource = String(L.videoSource ?? "");
   }
-
   if (!L.srcRect || !parseRect(L.srcRect)) L.srcRect = "0,0,1,1";
   if (!L.dstPos  || !parsePos(L.dstPos))   L.dstPos  = "0,0";
   if (!L.scale   || !parseScale(L.scale))  L.scale   = "1.0,1.0";
   if (L.type === 'video') ensureVideoFilterDefaults(L);
-
   if (!L.crosshair) {
     L.crosshair = {enabled:false, diam:"50x50", center:"", thickness:1, mode:"solid", color:"255,255,255", opacity:1.0, invertRel:"none"};
   } else {
@@ -762,7 +749,6 @@ function ensureLayerDefaults(L){
   }
   return L;
 }
-
 function normalizeCfg(c){
   c.layers = c.layers || [];
   c.layers = c.layers.map(L => ensureLayerDefaults(L));
@@ -772,14 +758,10 @@ function normalizeCfg(c){
   if (c.preferOutputMode === undefined) c.preferOutputMode = true;
   if (!c.preferOutputRes) c.preferOutputRes = "1280x720";
   if (c.viewport === undefined) c.viewport = "";
-
-  // NEW: v4l2Sources array (optional)
   if (!Array.isArray(c.v4l2Sources)) c.v4l2Sources = [];
   c.v4l2Sources = c.v4l2Sources.map(String).filter(s => s.length);
-
   return c;
 }
-
 function setMode(m){
   ui.mode = m;
   document.getElementById('pillMode').textContent = `mode: ${m}`;
@@ -791,7 +773,6 @@ function setMode(m){
   }
   renderAll();
 }
-
 function getViewportWH(){
   let vpw=0,vph=0;
   const viewportStr = (cfg && typeof cfg.viewport === 'string') ? cfg.viewport : '';
@@ -805,7 +786,6 @@ function getViewportWH(){
   vph = clamp(vph, 1, LIMITS.dim.max);
   return {vpw,vph};
 }
-
 function updateStageMetrics(){
   const img = document.getElementById('refImg');
   if (!img) return;
@@ -816,12 +796,10 @@ function updateStageMetrics(){
   stage.vpw = v.vpw;
   stage.vph = v.vph;
 }
-
 function vpToStageX(v){ return v * (stage.stageW / stage.vpw); }
 function vpToStageY(v){ return v * (stage.stageH / stage.vph); }
 function stageToVpX(px){ return px * (stage.vpw / stage.stageW); }
 function stageToVpY(px){ return px * (stage.vph / stage.stageH); }
-
 function computeLayerBoxVP(L){
   const dp = parsePos(L.dstPos) || {x:0,y:0};
   const sr = parseRect(L.srcRect) || {x:0,y:0,w:1,h:1};
@@ -832,7 +810,6 @@ function computeLayerBoxVP(L){
   if (!isFinite(h) || h < 1) h = 1;
   return {x: dp.x, y: dp.y, w, h};
 }
-
 function writeLayerFromBoxVP(L, box){
   const sr = parseRect(L.srcRect) || {x:0,y:0,w:1,h:1};
   const sw = Math.max(1, sr.w);
@@ -842,12 +819,10 @@ function writeLayerFromBoxVP(L, box){
   L.dstPos = `${round(box.x)},${round(box.y)}`;
   L.scale = `${fmt(sx)},${fmt(sy)}`;
 }
-
 function snap(v, step, enabled){
   if (!enabled) return v;
   return Math.round(v / step) * step;
 }
-
 function renderVPHelp(){
   const el = document.getElementById('vpHelp');
   if (!el) return;
@@ -863,7 +838,6 @@ function renderVPHelp(){
   }
   el.innerHTML = `Viewport coordinate space: <strong>${d.w}×${d.h}</strong>`;
 }
-
 function clampLayerSrcRectToCaptureProxy(L){
   const sr = parseRect(L.srcRect);
   if (!sr) return;
@@ -879,8 +853,6 @@ function clampLayerSrcRectToCaptureProxy(L){
   if (y + h > H) h = Math.max(1, H - y);
   L.srcRect = `${round(x)},${round(y)},${round(w)},${round(h)}`;
 }
-
-/*** Add layer helpers ***/
 function nextVideoLayerName(){
   const used = new Set();
   (cfg && cfg.layers ? cfg.layers : []).forEach(L => {
@@ -892,7 +864,6 @@ function nextVideoLayerName(){
   while (used.has(n)) n++;
   return `Video ${n}`;
 }
-
 function makeDefaultVideoLayer(){
   const W = stage.imgNaturalW || 0;
   const H = stage.imgNaturalH || 0;
@@ -907,13 +878,11 @@ function makeDefaultVideoLayer(){
     dstPos: "0,0",
     scale: "1.0,1.0",
     filters: [],
-    videoSource: "" // NEW: empty means "use cfg.v4l2Dev"
+    videoSource: ""
   };
   ensureLayerDefaults(L);
   return L;
 }
-
-/*** Stage pointer handling ***/
 function stageClientToVP(ev){
   const img = document.getElementById('refImg');
   const r = img.getBoundingClientRect();
@@ -1026,45 +995,6 @@ function hookStagePointer(){
   stageEl.onpointerup = () => stopStageDrag();
   stageEl.onpointercancel = () => stopStageDrag();
 }
-
-/*** Crop helpers (same behavior as before) ***/
-function normalizeRect(r, layerBoxVP){
-  let x = r.x, y = r.y, w = r.w, h = r.h;
-  if (w < 0) { x += w; w = -w; }
-  if (h < 0) { y += h; h = -h; }
-  w = Math.max(1, w);
-  h = Math.max(1, h);
-  x = clamp(x, 0, layerBoxVP.w - 1);
-  y = clamp(y, 0, layerBoxVP.h - 1);
-  if (x + w > layerBoxVP.w) w = Math.max(1, layerBoxVP.w - x);
-  if (y + h > layerBoxVP.h) h = Math.max(1, layerBoxVP.h - y);
-  return {x, y, w, h};
-}
-function updateCropReadout(layerBoxVP){
-  const el = document.getElementById('cropReadout');
-  if (!el) return;
-  if (!ui.crop.rect) { el.textContent='(none)'; return; }
-  const r = ui.crop.rect;
-  const L = cfg ? cfg.layers[selectedIdx] : null;
-  if (!L) { el.textContent='(none)'; return; }
-  const sr = parseRect(L.srcRect);
-  const sc = parseScale(L.scale);
-  if (!sr || !sc || !(sc.sx>0 && sc.sy>0) || !(sr.w>0 && sr.h>0)) {
-    el.textContent = `layer-local vp: x=${round(r.x)}, y=${round(r.y)}, w=${round(r.w)}, h=${round(r.h)} (src mapping unavailable)`;
-    return;
-  }
-  const offXsrc = r.x / sc.sx;
-  const offYsrc = r.y / sc.sy;
-  const wsrc = r.w / sc.sx;
-  const hsrc = r.h / sc.sy;
-  el.textContent =
-    `layer-local vp: x=${round(r.x)}, y=${round(r.y)}, w=${round(r.w)}, h=${round(r.h)}  |  srcRect add: (${round(offXsrc)},${round(offYsrc)}) size: ${round(wsrc)}x${round(hsrc)}`;
-}
-function commitCrop(){
-  alert("Crop logic unchanged; not included in this script snippet. Ask me to include it fully.");
-}
-
-/*** Rendering ***/
 function renderStage(){
   if (!cfg) return;
   updateStageMetrics();
@@ -1106,8 +1036,8 @@ function renderStage(){
 }
 function renderCrosshairPreview(){
   if (!cfg) return;
+  // (frontend preview optional; keeping stub)
 }
-
 function renderLayersTable(){
   if (!cfg) return;
   const tb = document.getElementById('layersTable');
@@ -1177,7 +1107,6 @@ function renderLayersTable(){
     tb.appendChild(tr);
   });
 }
-
 function renderFilterAddSelect(){
   const sel = document.getElementById('fAddType');
   if (!sel) return;
@@ -1190,7 +1119,6 @@ function renderFilterAddSelect(){
     sel.appendChild(opt);
   });
 }
-
 function renderFiltersUIForLayer(L){
   const box = document.getElementById('filtersBox');
   const chip = document.getElementById('fCountChip');
@@ -1328,10 +1256,7 @@ function renderFiltersUIForLayer(L){
     box.appendChild(el);
   });
 }
-
-// ---- Source list helpers (NEW) ----
 function getKnownSources(){
-  // sources from config + from runtime status (if present)
   const set = new Set();
   const arr = [];
   const add = (s) => {
@@ -1341,14 +1266,10 @@ function getKnownSources(){
     set.add(v);
     arr.push(v);
   };
-
   if (cfg && cfg.v4l2Dev) add(cfg.v4l2Dev);
   if (cfg && Array.isArray(cfg.v4l2Sources)) cfg.v4l2Sources.forEach(add);
-
   const rtSources = runtime && runtime.runtime && Array.isArray(runtime.runtime.sources) ? runtime.runtime.sources : [];
   rtSources.forEach(x => add(x.dev));
-
-  // common defaults
   add("/dev/video0");
   add("/dev/video1");
   return arr;
@@ -1361,25 +1282,17 @@ function renderVideoSourceSelectForLayer(L){
   const sel = document.getElementById('iVideoSource');
   const help = document.getElementById('iVideoSourceHelp');
   if (!sel || !help) return;
-
   if (!L || L.type !== 'video') {
     sel.innerHTML = '';
     sel.disabled = true;
     help.textContent = '';
     return;
   }
-
   sel.disabled = false;
-
   const known = getKnownSources();
   const active = new Set(getActiveSourcesFromRuntime());
-
-  // Determine currently selected
   const cur = (L.videoSource && L.videoSource.length) ? L.videoSource : "";
-
   sel.innerHTML = '';
-
-  // Option: inherit default (empty string)
   {
     const opt = document.createElement('option');
     opt.value = "";
@@ -1388,7 +1301,6 @@ function renderVideoSourceSelectForLayer(L){
     if (cur === "") opt.selected = true;
     sel.appendChild(opt);
   }
-
   known.forEach(dev => {
     const opt = document.createElement('option');
     opt.value = dev;
@@ -1396,8 +1308,6 @@ function renderVideoSourceSelectForLayer(L){
     if (cur === dev) opt.selected = true;
     sel.appendChild(opt);
   });
-
-  // If the current value isn't in known list, add it so it doesn't get lost.
   if (cur && !known.includes(cur)) {
     const opt = document.createElement('option');
     opt.value = cur;
@@ -1405,15 +1315,12 @@ function renderVideoSourceSelectForLayer(L){
     opt.selected = true;
     sel.appendChild(opt);
   }
-
   sel.onchange = () => {
-    L.videoSource = sel.value; // may be "" (inherit)
+    L.videoSource = sel.value;
     validateCfg();
     renderStage();
     renderInspector();
   };
-
-  // Update help with runtime active info
   const effective = cur ? cur : (cfg && cfg.v4l2Dev ? cfg.v4l2Dev : "");
   if (!effective) {
     help.textContent = "No default source configured.";
@@ -1425,7 +1332,6 @@ function renderVideoSourceSelectForLayer(L){
     help.textContent = `Effective source ${effective}. (No runtime source status yet.)`;
   }
 }
-
 function renderInspector(){
   if (!cfg) return;
   const chip = document.getElementById('inspectorChip');
@@ -1448,16 +1354,13 @@ function renderInspector(){
       ? 'Crosshair preview shown in the viewport.'
       : 'Layer type not fully implemented yet.';
   body.style.display = 'block';
-
   document.getElementById('iName').value = L.name || '';
   document.getElementById('iType').value = L.type || 'video';
   document.getElementById('iEnabled').checked = !!L.enabled;
   document.getElementById('iOpacity').value = clamp(Number(L.opacity ?? 1),0,1);
   document.getElementById('iInvertRel').value = L.invertRel || 'none';
-
   vid.style.display = (L.type === 'video') ? 'block' : 'none';
   xh.style.display  = (L.type === 'crosshair') ? 'block' : 'none';
-
   if (L.type === 'video') {
     renderVideoSourceSelectForLayer(L);
     document.getElementById('iSrcRect').value = L.srcRect || '0,0,1,1';
@@ -1466,19 +1369,13 @@ function renderInspector(){
     renderFiltersUIForLayer(L);
   }
 }
-
 function validateCfg(){
   if (!cfg) return [];
   const errors = [];
-
-  // Validate v4l2Sources field if present
   if (cfg.v4l2Sources && !Array.isArray(cfg.v4l2Sources)) errors.push("v4l2Sources must be array");
-
   cfg.layers.forEach((L, idx) => {
     ensureLayerDefaults(L);
-
     if (L.type === 'video') {
-      // videoSource is optional but must be string
       if (L.videoSource !== undefined && typeof L.videoSource !== 'string') errors.push(`layer ${idx}: videoSource must be string`);
       ensureVideoFilterDefaults(L);
       L.filters.forEach((f, fi) => {
@@ -1500,7 +1397,6 @@ function validateCfg(){
       });
     }
   });
-
   const box = document.getElementById('validationBox');
   if (box) {
     if (errors.length === 0) {
@@ -1513,15 +1409,12 @@ function validateCfg(){
   }
   return errors;
 }
-
 async function refreshStatus(){
   try {
     const st = await api('/api/status');
     runtime = st || null;
     const s = document.getElementById('status');
     if (s) s.textContent = JSON.stringify(st, null, 2);
-
-    // update inspector source help text if open
     if (cfg && selectedIdx >= 0 && selectedIdx < cfg.layers.length) {
       renderInspector();
     }
@@ -1530,7 +1423,6 @@ async function refreshStatus(){
     if (s) s.textContent = `status error: ${e}`;
   }
 }
-
 function setFormFromCfg(c){
   document.getElementById('v4l2Dev').value = c.v4l2Dev||'/dev/video0';
   document.getElementById('v4l2Sources').value = (Array.isArray(c.v4l2Sources) && c.v4l2Sources.length) ? c.v4l2Sources.join(',') : '';
@@ -1543,22 +1435,17 @@ function setFormFromCfg(c){
   document.getElementById('bgr').checked = !!c.bgr;
   renderVPHelp();
 }
-
 function cfgFromForm(){
-  // Normalize layers before sending to avoid backend apply failures.
   cfg.layers = (cfg.layers||[]).map(L => ensureLayerDefaults(L));
-
-  // Coerce filter param types
   (cfg.layers||[]).forEach(L => {
     if (L.type !== 'video') return;
     if (!Array.isArray(L.filters)) return;
     L.filters.forEach(f => coerceFilterParamsInPlace(f));
   });
-
   const v4l2Sources = parseCSVStrings(document.getElementById('v4l2Sources').value);
   return {
     v4l2Dev: document.getElementById('v4l2Dev').value,
-    v4l2Sources, // NEW
+    v4l2Sources,
     edidPath: document.getElementById('edidPath').value,
     present: document.getElementById('present').value,
     viewport: document.getElementById('viewport').value,
@@ -1569,7 +1456,6 @@ function cfgFromForm(){
     layers: cfg.layers||[]
   };
 }
-
 async function loadAll(){
   cfg = await api('/api/config');
   cfg = normalizeCfg(cfg);
@@ -1578,7 +1464,6 @@ async function loadAll(){
   validateCfg();
   renderAll();
 }
-
 async function loadFilterDefs(){
   try {
     const j = await api('/api/filters');
@@ -1592,13 +1477,11 @@ async function loadFilterDefs(){
     renderAll();
   }
 }
-
 function hookGlobalUI(){
   document.getElementById('btnReload').onclick = async () => {
     setMode('select');
     await loadAll();
   };
-
   document.getElementById('btnApply').onclick = async () => {
     const errs = validateCfg();
     if (errs.length) {
@@ -1618,12 +1501,9 @@ function hookGlobalUI(){
     }
     await refreshStatus();
   };
-
   document.getElementById('btnQuit').onclick = async () => {
     await api('/api/quit', {method:'POST'});
   };
-
-  // Add Video (append new layer, don't overwrite)
   document.getElementById('btnAddVideo').onclick = () => {
     if (!cfg) return;
     if (!Array.isArray(cfg.layers)) cfg.layers = [];
@@ -1634,29 +1514,29 @@ function hookGlobalUI(){
     validateCfg();
     renderAll();
   };
+  document.getElementById('btnAddCrosshair').onclick = () => {
+    alert("Crosshair layer UI exists in inspector, but add-crosshair not wired in this webui build.");
+  };
+  document.getElementById('btnCrop').onclick = () => {
+    alert("Crop mode UI present; crop commit logic not implemented in this webui build.");
+  };
 }
-
 function hookInspector(){
-  // Wire up base inspector controls + per-layer fields.
   const byId = (id) => document.getElementById(id);
-
   const iName = byId('iName');
   const iEnabled = byId('iEnabled');
   const iOpacity = byId('iOpacity');
   const iInvertRel = byId('iInvertRel');
   const btnDupLayer = byId('btnDupLayer');
-
   const iSrcRect = byId('iSrcRect');
   const iDstPos = byId('iDstPos');
   const iScale = byId('iScale');
   const btnClampSrc = byId('btnClampSrc');
-
   function curLayer(){
     if (!cfg) return null;
     if (selectedIdx < 0 || selectedIdx >= cfg.layers.length) return null;
     return cfg.layers[selectedIdx];
   }
-
   iName.onchange = () => {
     const L = curLayer(); if (!L) return;
     L.name = iName.value;
@@ -1685,8 +1565,6 @@ function hookInspector(){
     selectedIdx = selectedIdx+1;
     validateCfg(); renderAll();
   };
-
-  // Video inspector fields
   iSrcRect.onchange = () => {
     const L = curLayer(); if (!L || L.type !== 'video') return;
     if (!parseRect(iSrcRect.value)) return;
@@ -1710,8 +1588,6 @@ function hookInspector(){
     clampLayerSrcRectToCaptureProxy(L);
     validateCfg(); renderInspector(); renderStage();
   };
-
-  // Global fields that affect vp help
   document.getElementById('viewport').oninput = () => {
     if (!cfg) return;
     cfg.viewport = document.getElementById('viewport').value;
@@ -1719,7 +1595,6 @@ function hookInspector(){
     renderStage();
   };
 }
-
 function hookImageNaturalSize(){
   const img = document.getElementById('refImg');
   img.onload = () => {
@@ -1729,16 +1604,13 @@ function hookImageNaturalSize(){
     renderAll();
   };
 }
-
 function renderAll(){
   if (!cfg) return;
   renderLayersTable();
   renderInspector();
   renderStage();
 }
-
 setInterval(refreshStatus, 1000);
-
 (async () => {
   hookGlobalUI();
   hookInspector();
@@ -1749,16 +1621,17 @@ setInterval(refreshStatus, 1000);
   await refreshStatus();
 })();
 </script>
-
 </body>
 </html>)HTML";
 
 void webui_start_detached(int port) {
   std::thread([port]() {
     httplib::Server svr;
+
     svr.Get("/", [](const httplib::Request&, httplib::Response &res) {
       res.set_content(kIndexHtml, "text/html; charset=utf-8");
     });
+
     svr.Get("/ref.png", [](const httplib::Request&, httplib::Response &res) {
       std::vector<uint8_t> png;
       {
@@ -1772,6 +1645,7 @@ void webui_start_detached(int port) {
       }
       res.set_content(reinterpret_cast<const char*>(png.data()), png.size(), "image/png");
     });
+
     svr.Get("/api/config", [](const httplib::Request&, httplib::Response &res) {
       std::string (*cfgp)() = nullptr;
       {
@@ -1785,6 +1659,7 @@ void webui_start_detached(int port) {
       }
       res.set_content(cfgp(), "application/json");
     });
+
     svr.Get("/api/status", [](const httplib::Request&, httplib::Response &res) {
       std::string (*st)() = nullptr;
       {
@@ -1798,6 +1673,7 @@ void webui_start_detached(int port) {
       }
       res.set_content(st(), "application/json");
     });
+
     // Optional dynamic filter enumeration
     svr.Get("/api/filters", [](const httplib::Request&, httplib::Response &res) {
       std::string (*fp)() = nullptr;
@@ -1813,6 +1689,33 @@ void webui_start_detached(int port) {
       }
       res.set_content(fp(), "application/json");
     });
+
+    // NEW: V4L2 caps endpoint
+    svr.Get("/api/v4l2/caps", [](const httplib::Request &req, httplib::Response &res) {
+      std::string (*fn)(const std::string&) = nullptr;
+      {
+        std::lock_guard<std::mutex> lk(g_mtx);
+        fn = g_v4l2_caps;
+      }
+      if (!fn) {
+        res.status = 404;
+        res.set_content("{\"error\":\"no v4l2 caps provider\"}", "application/json");
+        return;
+      }
+      if (!req.has_param("dev")) {
+        res.status = 400;
+        res.set_content("{\"error\":\"missing dev\"}", "application/json");
+        return;
+      }
+      std::string dev = req.get_param_value("dev");
+      if (dev.empty()) {
+        res.status = 400;
+        res.set_content("{\"error\":\"missing dev\"}", "application/json");
+        return;
+      }
+      res.set_content(fn(dev), "application/json");
+    });
+
     svr.Post("/api/apply", [](const httplib::Request &req, httplib::Response &res) {
       bool (*apply)(const std::string&, std::string&, int&) = nullptr;
       {
@@ -1830,6 +1733,7 @@ void webui_start_detached(int port) {
       res.status = st;
       res.set_content(out, "application/json");
     });
+
     svr.Post("/api/quit", [](const httplib::Request&, httplib::Response &res) {
       std::atomic<bool> *q = nullptr;
       {
@@ -1839,6 +1743,7 @@ void webui_start_detached(int port) {
       if (q) q->store(true);
       res.set_content("{\"ok\":true}", "application/json");
     });
+
     std::string addr;
     {
       std::lock_guard<std::mutex> lk(g_mtx);

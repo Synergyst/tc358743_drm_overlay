@@ -1,30 +1,17 @@
 /*
   Optimized compositor version + per-video-layer filter stack (post-scale).
-
-  Added in this version:
+  Added earlier:
   - Per-video-layer filters: layer.filters = [{id, params}, ...]
-    * Filters run on the layer’s post-scale grid (layer_map_cache vp_w × vp_h).
-    * Implemented filters:
-        - mono: grayscale conversion (params: strength 0..1)
-        - sobel: edgesOnly (non-edges transparent) or magnitude (grayscale)
-            params:
-              mode: "edgesOnly" | "magnitude"
-              threshold: 0..255  (edgesOnly)
-              alpha: 0..1        (edgesOnly, edge opacity)
-              invert: bool
   - GET /api/filters: returns filter registry for WebUI dynamic enumeration.
 
-  Notes / constraints:
-  - Filters are applied independent of other layers (operate only on the layer’s pixels).
-  - Filters currently only apply to VIDEO layers (crosshair/graphics ignored for now).
-  - To keep CPU low, we render each filtered video layer into a small scratch buffer
-    (layer size), apply its filter chain, then composite into output.
+  This update (multi-source):
+  - persisted_config.v4l2Sources (array) + per-layer videoSource (string)
+  - /api/status includes runtime.sources[] with active/link info
+  - Backend auto-disables video layers whose selected source is not active
 */
-
 #ifndef _GNU_SOURCE
 #define _GNU_SOURCE
 #endif
-
 #include <assert.h>
 #include <errno.h>
 #include <fcntl.h>
@@ -57,17 +44,15 @@
 #include <fstream>
 #include <algorithm>
 #include <cmath>
-
+#include <map>
 #if defined(__aarch64__) || defined(__ARM_NEON)
   #include <arm_neon.h>
   #define HAVE_NEON 1
 #else
   #define HAVE_NEON 0
 #endif
-
 #include "third_party/json.hpp"
 #include "tc358743_webui.h"
-
 using nlohmann::json;
 
 // -------------------- Helpers --------------------
@@ -369,6 +354,47 @@ static void dump_first_pixels_rgb24(const uint8_t *src) {
   fprintf(stderr, "\n");
 }
 
+// ---- Multi-source probing helpers ----
+struct source_probe {
+  bool present = false;
+  bool active = false;
+  uint32_t dv_w = 0, dv_h = 0;
+  uint64_t pixelclock = 0;
+  uint32_t fmt_w = 0, fmt_h = 0;
+  uint32_t stride = 0;
+  uint32_t pixfmt = 0;
+  std::string err;
+};
+static source_probe probe_v4l2_source(const std::string &dev) {
+  source_probe p{};
+  int fd = v4l2_open(dev.c_str(), O_RDWR | O_NONBLOCK, 0);
+  if (fd < 0) {
+    p.present = false;
+    p.active = false;
+    p.err = std::string("open failed: ") + strerror(errno);
+    return p;
+  }
+  p.present = true;
+  uint32_t tw=0, th=0; uint64_t pc=0;
+  if (tc358743_query_dv_timings(fd, &tw, &th, &pc) == 0 && tw > 0 && th > 0) {
+    p.active = true;
+    p.dv_w = tw;
+    p.dv_h = th;
+    p.pixelclock = pc;
+  } else {
+    p.active = false;
+  }
+  uint32_t fw=0, fh=0, st=0, pf=0;
+  if (v4l2_get_current_fmt(fd, &fw, &fh, &st, &pf) == 0) {
+    p.fmt_w = fw;
+    p.fmt_h = fh;
+    p.stride = st;
+    p.pixfmt = pf;
+  }
+  v4l2_close(fd);
+  return p;
+}
+
 // ---------------- DRM scanout helpers ----------------
 struct dumb_fb {
   uint32_t fb_id;
@@ -599,6 +625,26 @@ struct runtime_info {
   uint32_t vph = 0;
   present_rect pr{};
   std::string present_policy = "fit";
+
+  struct source_rt {
+    std::string dev;
+    bool present=false;
+    bool active=false;
+    uint32_t dv_w=0, dv_h=0;
+    uint64_t pixelclock=0;
+    uint32_t fmt_w=0, fmt_h=0;
+    uint32_t stride=0;
+    uint32_t pixfmt=0;
+    std::string err;
+  };
+  std::vector<source_rt> sources;
+
+  struct layer_rt {
+    std::string requested;
+    std::string resolved;
+    bool active=false;
+  };
+  std::vector<layer_rt> layerSources;
 };
 static runtime_info g_rt;
 
@@ -665,7 +711,6 @@ static int drm_plane_flip_fb_only(int drm_fd, uint32_t plane_id, uint32_t prop_f
 // ---------------- Layers / compositor ----------------
 struct rect_u32 { uint32_t x=0,y=0,w=0,h=0; };
 struct point_i32 { int32_t x=0,y=0; };
-
 static inline uint32_t invert_xrgb8888(uint32_t xrgb) {
   return (xrgb & 0xFF000000u) | ((xrgb ^ 0x00FFFFFFu) & 0x00FFFFFFu);
 }
@@ -682,22 +727,17 @@ static inline uint32_t blend_over_xrgb(uint32_t under, uint32_t over, uint8_t a)
   uint32_t bb=(ob*a  + ub*(255-a) + 127)/255;
   return 0xFF000000u | (rr<<16) | (gg<<8) | bb;
 }
-
 enum layer_invert_rel { INV_NONE=0, INV_LOWER=1, INV_UPPER=2 };
 enum layer_type { LAYER_VIDEO=0, LAYER_CROSSHAIR=1, LAYER_GRAPHICS=2 };
 
 // ---------------- Filter stack config ----------------
 enum filter_id { FILTER_MONO=1, FILTER_SOBEL=2, FILTER_UNKNOWN=0 };
-
 struct filter_cfg {
   filter_id id = FILTER_UNKNOWN;
-  // common: id string stored separately via json; but we keep parsed here
-  // mono params
-  float mono_strength = 1.0f; // 0..1
-  // sobel params
+  float mono_strength = 1.0f;
   enum sobel_mode_t { SOBEL_EDGES_ONLY=0, SOBEL_MAGNITUDE=1 } sobel_mode = SOBEL_EDGES_ONLY;
-  uint8_t sobel_threshold = 64; // edgesOnly
-  float sobel_alpha = 1.0f;     // edgesOnly
+  uint8_t sobel_threshold = 64;
+  float sobel_alpha = 1.0f;
   bool sobel_invert = false;
 };
 
@@ -717,6 +757,10 @@ struct layer_cfg {
   std::string name="Layer";
   layer_type type=LAYER_VIDEO;
   bool enabled=true;
+
+  // per-video-layer source selection (device path), empty => use config.v4l2Dev
+  std::string video_source;
+
   rect_u32 src_rect{0,0,0,0};
   point_i32 dst_pos{0,0};
   float scale_x=1.0f;
@@ -763,7 +807,6 @@ static void composite_crosshair_bounded(uint8_t *dst_xrgb, uint32_t dst_stride, 
   int32_t vx1 = rt.out_cx + rt.half_th;
   int32_t vy0 = rt.out_cy - rt.half_h;
   int32_t vy1 = rt.out_cy + rt.half_h;
-
   int32_t ys = clampi(hy0, (int32_t)y0, (int32_t)y1-1);
   int32_t ye = clampi(hy1, (int32_t)y0, (int32_t)y1-1);
   int32_t xs = clampi(hx0, 0, (int32_t)out_w-1);
@@ -781,7 +824,6 @@ static void composite_crosshair_bounded(uint8_t *dst_xrgb, uint32_t dst_stride, 
       drow[x] = blend_over_xrgb(drow[x], over, alpha);
     }
   }
-
   ys = clampi(vy0, (int32_t)y0, (int32_t)y1-1);
   ye = clampi(vy1, (int32_t)y0, (int32_t)y1-1);
   xs = clampi(vx0, 0, (int32_t)out_w-1);
@@ -842,7 +884,7 @@ static inline void clear_xrgb_rows_fast(uint8_t *dst_xrgb, uint32_t dst_stride, 
   }
 }
 
-struct rect_i32 { int32_t x0=0, y0=0, x1=0, y1=0; }; // [x0,x1) [y0,y1)
+struct rect_i32 { int32_t x0=0, y0=0, x1=0, y1=0; };
 static inline rect_i32 rect_intersect(const rect_i32 &a, const rect_i32 &b) {
   rect_i32 r;
   r.x0 = std::max(a.x0, b.x0);
@@ -897,8 +939,8 @@ struct out_to_vp_lut {
   uint32_t out_w=0, out_h=0;
   uint32_t vpw=0, vph=0;
   present_rect pr{};
-  std::vector<int32_t> ox_to_vx; // out_w
-  std::vector<int32_t> oy_to_vy; // out_h
+  std::vector<int32_t> ox_to_vx;
+  std::vector<int32_t> oy_to_vy;
   void rebuild(uint32_t outW, uint32_t outH, uint32_t vpW, uint32_t vpH, const present_rect &p) {
     out_w=outW; out_h=outH; vpw=vpW; vph=vpH; pr=p;
     ox_to_vx.assign(out_w, -1);
@@ -985,22 +1027,18 @@ static inline void write4_opaque_rgb24_to_xrgb(uint32_t *dst, const uint8_t *src
 #endif
 
 // ---------------- Filters (operate on layer buffers) ----------------
-// Buffer format: XRGB8888 packed, row stride = w (not bytes)
 struct layer_buf {
   uint32_t w=0, h=0;
-  std::vector<uint32_t> px; // size w*h
+  std::vector<uint32_t> px;
   void resize(uint32_t W, uint32_t H) {
     w=W; h=H;
     px.resize((size_t)w*(size_t)h);
   }
 };
-
 static inline uint8_t luma_u8_from_xrgb(uint32_t p) {
   uint32_t r=(p>>16)&0xFF, g=(p>>8)&0xFF, b=p&0xFF;
-  // integer approx: 0.299R + 0.587G + 0.114B
   return (uint8_t)((r*77 + g*150 + b*29 + 128) >> 8);
 }
-
 static void filter_apply_mono(layer_buf &buf, float strength) {
   strength = std::clamp(strength, 0.0f, 1.0f);
   if (strength <= 0.0f) return;
@@ -1024,33 +1062,22 @@ static void filter_apply_mono(layer_buf &buf, float strength) {
     buf.px[i] = 0xFF000000u | (rr<<16) | (gg<<8) | bb;
   }
 }
-
 static void filter_apply_sobel(layer_buf &buf,
                               filter_cfg::sobel_mode_t mode,
                               uint8_t threshold,
                               float alpha_f,
                               bool invert) {
   if (buf.w < 3 || buf.h < 3) {
-    // tiny buffer: treat as no-edges; edgesOnly => transparent; magnitude => black
-    if (mode == filter_cfg::SOBEL_EDGES_ONLY) {
-      std::fill(buf.px.begin(), buf.px.end(), 0x00000000u);
-    } else {
-      std::fill(buf.px.begin(), buf.px.end(), 0xFF000000u);
-    }
+    if (mode == filter_cfg::SOBEL_EDGES_ONLY) std::fill(buf.px.begin(), buf.px.end(), 0x00000000u);
+    else std::fill(buf.px.begin(), buf.px.end(), 0xFF000000u);
     return;
   }
-
   alpha_f = std::clamp(alpha_f, 0.0f, 1.0f);
   uint8_t edge_a = (uint8_t)std::lround(alpha_f * 255.0f);
   std::vector<uint8_t> lum((size_t)buf.w*(size_t)buf.h);
   for (size_t i=0;i<buf.px.size();i++) lum[i] = luma_u8_from_xrgb(buf.px[i]);
-
-  // output
   std::vector<uint32_t> out(buf.px.size());
-
   auto idx = [&](int x,int y)->size_t { return (size_t)y*(size_t)buf.w + (size_t)x; };
-
-  // borders
   if (mode == filter_cfg::SOBEL_EDGES_ONLY) {
     uint32_t t = 0x00000000u;
     for (uint32_t x=0;x<buf.w;x++) { out[idx((int)x,0)] = t; out[idx((int)x,(int)buf.h-1)] = t; }
@@ -1060,7 +1087,6 @@ static void filter_apply_sobel(layer_buf &buf,
     for (uint32_t x=0;x<buf.w;x++) { out[idx((int)x,0)] = t; out[idx((int)x,(int)buf.h-1)] = t; }
     for (uint32_t y=0;y<buf.h;y++) { out[idx(0,(int)y)] = t; out[idx((int)buf.w-1,(int)y)] = t; }
   }
-
   for (uint32_t y=1; y+1<buf.h; y++) {
     for (uint32_t x=1; x+1<buf.w; x++) {
       int xm1=(int)x-1, xp1=(int)x+1;
@@ -1073,49 +1099,41 @@ static void filter_apply_sobel(layer_buf &buf,
       int p20 = lum[idx(xm1,yp1)];
       int p21 = lum[idx((int)x,yp1)];
       int p22 = lum[idx(xp1,yp1)];
-
       int gx = (-p00 + p02) + (-2*p10 + 2*p12) + (-p20 + p22);
       int gy = (-p00 -2*p01 -p02) + (p20 +2*p21 + p22);
-
-      int mag = abs(gx) + abs(gy); // L1 approx
+      int mag = abs(gx) + abs(gy);
       if (mag > 255) mag = 255;
       uint8_t m = (uint8_t)mag;
       if (invert) m = (uint8_t)(255 - m);
-
       if (mode == filter_cfg::SOBEL_EDGES_ONLY) {
-        if (m < threshold || edge_a == 0) {
-          out[idx((int)x,(int)y)] = 0x00000000u; // fully transparent non-edge
-        } else {
-          // edge pixel grayscale with alpha=edge_a
-          out[idx((int)x,(int)y)] = ((uint32_t)edge_a<<24) | ((uint32_t)m<<16) | ((uint32_t)m<<8) | (uint32_t)m;
-        }
+        if (m < threshold || edge_a == 0) out[idx((int)x,(int)y)] = 0x00000000u;
+        else out[idx((int)x,(int)y)] = ((uint32_t)edge_a<<24) | ((uint32_t)m<<16) | ((uint32_t)m<<8) | (uint32_t)m;
       } else {
-        // magnitude mode: opaque grayscale
         out[idx((int)x,(int)y)] = 0xFF000000u | ((uint32_t)m<<16) | ((uint32_t)m<<8) | (uint32_t)m;
       }
     }
   }
-
   buf.px.swap(out);
 }
-
-// Apply a filter chain in-place to layer buffer
 static void apply_filter_chain(layer_buf &buf, const std::vector<filter_cfg> &filters) {
   for (const auto &f : filters) {
-    if (f.id == FILTER_MONO) {
-      filter_apply_mono(buf, f.mono_strength);
-    } else if (f.id == FILTER_SOBEL) {
-      filter_apply_sobel(buf, f.sobel_mode, f.sobel_threshold, f.sobel_alpha, f.sobel_invert);
-    }
+    if (f.id == FILTER_MONO) filter_apply_mono(buf, f.mono_strength);
+    else if (f.id == FILTER_SOBEL) filter_apply_sobel(buf, f.sobel_mode, f.sobel_threshold, f.sobel_alpha, f.sobel_invert);
   }
 }
 
 // ---------------- Compositor thread pool ----------------
 struct comp_job {
   uint64_t job_id=0;
-  const uint8_t *src_rgb=nullptr;
-  uint32_t src_stride=0;
-  uint32_t in_w=0,in_h=0;
+  struct source_frame {
+    std::string dev;
+    const uint8_t *src_rgb=nullptr;
+    uint32_t src_stride=0;
+    uint32_t in_w=0,in_h=0;
+    bool valid=false;
+  };
+  std::vector<source_frame> sources;
+
   bool input_is_bgr=false;
   uint8_t *dst_xrgb=nullptr;
   uint32_t dst_stride=0;
@@ -1126,12 +1144,10 @@ struct comp_job {
   const invert_upper_cache *upper_cache=nullptr;
   const out_to_vp_lut *lut=nullptr;
   const std::vector<layer_map_cache> *layer_maps=nullptr;
-  // scratch buffers per job (shared; partitioned by y bands internally by choosing bands outside)
-  // For filtered layers we do per-layer raster to small buffers then composite; handled in worker path
+  const std::vector<int> *layer_source_index=nullptr;
 };
 
 struct comp_worker { pthread_t th{}; int id=0; int cpu=-1; uint32_t y0=0,y1=0; };
-
 static pthread_mutex_t g_comp_mtx = PTHREAD_MUTEX_INITIALIZER;
 static pthread_cond_t  g_comp_cv_job = PTHREAD_COND_INITIALIZER;
 static pthread_cond_t  g_comp_cv_done = PTHREAD_COND_INITIALIZER;
@@ -1154,38 +1170,36 @@ static void pin_thread_to_cpu(int cpu) {
 #endif
 }
 
-// Precompute if a layer has filters
-static inline bool layer_has_filters(const layer_cfg &L) {
-  return (L.type == LAYER_VIDEO) && !L.filters.empty();
+static inline const comp_job::source_frame* job_find_source(const comp_job &job, int source_index) {
+  if (source_index < 0) return nullptr;
+  if ((size_t)source_index >= job.sources.size()) return nullptr;
+  const auto &sf = job.sources[(size_t)source_index];
+  if (!sf.valid || !sf.src_rgb) return nullptr;
+  return &sf;
 }
 
-// Composite a non-filtered video layer directly (existing optimized path)
-// (kept mostly identical to prior behavior)
 static void composite_video_direct_rows(const comp_job &job,
-                                       const layer_cfg &L,
+                                       const layer_cfg & /*L*/,
                                        const layer_map_cache &M,
                                        const uint32_t *upper_buf,
-                                       uint32_t y0, uint32_t y1) {
+                                       uint32_t y0, uint32_t y1,
+                                       const comp_job::source_frame &sf) {
   const out_to_vp_lut &lut = *job.lut;
   const uint8_t a = M.alpha;
   const bool bgr = job.input_is_bgr;
-
   rect_i32 ob = layer_vp_rect_to_output_bounds(job.map_pr, job.vpw, job.vph, M.dst_x, M.dst_y, M.vp_w, M.vp_h);
   ob = clamp_bounds_to_output_and_band(ob, job.out_w, job.out_h, y0, y1);
   if (rect_empty(ob)) return;
-
   for (int32_t oy=ob.y0; oy<ob.y1; oy++) {
     int32_t vy = lut.oy_to_vy[(uint32_t)oy];
     if (vy < 0) continue;
     int32_t lvy = vy - M.dst_y;
     if ((uint32_t)lvy >= (uint32_t)M.vp_h) continue;
     uint32_t syi = M.sr.y + (uint32_t)M.y_map[(size_t)lvy];
-
+    if (syi >= sf.in_h) continue;
     uint32_t *drow = (uint32_t*)(job.dst_xrgb + (uint64_t)oy * job.dst_stride);
     const uint32_t *urow = upper_buf ? (upper_buf + (size_t)oy*(size_t)job.out_w) : nullptr;
-
     const bool opaque_simple = (a == 255 && M.inv == INV_NONE && upper_buf == nullptr);
-
     int32_t ox = ob.x0;
 #if HAVE_NEON
     if (opaque_simple) {
@@ -1208,7 +1222,8 @@ static void composite_video_direct_rows(const comp_job &job,
         sx_arr[1] = M.sr.x + (uint32_t)M.x_map[(size_t)lvx1];
         sx_arr[2] = M.sr.x + (uint32_t)M.x_map[(size_t)lvx2];
         sx_arr[3] = M.sr.x + (uint32_t)M.x_map[(size_t)lvx3];
-        write4_opaque_rgb24_to_xrgb(drow + ox, job.src_rgb, job.src_stride, syi, sx_arr, bgr);
+        if (sx_arr[0] >= sf.in_w || sx_arr[1] >= sf.in_w || sx_arr[2] >= sf.in_w || sx_arr[3] >= sf.in_w) break;
+        write4_opaque_rgb24_to_xrgb(drow + ox, sf.src_rgb, sf.src_stride, syi, sx_arr, bgr);
       }
     }
 #endif
@@ -1218,7 +1233,8 @@ static void composite_video_direct_rows(const comp_job &job,
       int32_t lvx = vx - M.dst_x;
       if ((uint32_t)lvx >= (uint32_t)M.vp_w) continue;
       uint32_t sxi = M.sr.x + (uint32_t)M.x_map[(size_t)lvx];
-      uint32_t over = sample_rgb24_xrgb(job.src_rgb, job.src_stride, sxi, syi, bgr);
+      if (sxi >= sf.in_w) continue;
+      uint32_t over = sample_rgb24_xrgb(sf.src_rgb, sf.src_stride, sxi, syi, bgr);
       if (M.inv == INV_LOWER) {
         over = invert_xrgb8888(drow[(uint32_t)ox]);
       } else if (M.inv == INV_UPPER) {
@@ -1231,49 +1247,34 @@ static void composite_video_direct_rows(const comp_job &job,
   }
 }
 
-// Filtered-layer path:
-// 1) Build layer buffer in layer-local output grid (vp_w×vp_h), XRGB8888 but alpha may be used by Sobel edgesOnly.
-// 2) Apply filter chain.
-// 3) Composite buffer into output using presentRect mapping (output->vp->layerlocal).
-//
-// To keep computation bounded: buffer size is vp_w×vp_h only.
 static void composite_video_filtered_rows(const comp_job &job,
                                          const layer_cfg &L,
                                          const layer_map_cache &M,
                                          const uint32_t *upper_buf,
-                                         uint32_t y0, uint32_t y1) {
+                                         uint32_t y0, uint32_t y1,
+                                         const comp_job::source_frame &sf) {
   const out_to_vp_lut &lut = *job.lut;
   const bool bgr = job.input_is_bgr;
-
   rect_i32 ob = layer_vp_rect_to_output_bounds(job.map_pr, job.vpw, job.vph, M.dst_x, M.dst_y, M.vp_w, M.vp_h);
-  // We'll compute band-clamped bounds later for final composite; but we need full layer buffer first.
   rect_i32 ob_full = clamp_bounds_to_output_and_band(ob, job.out_w, job.out_h, 0, job.out_h);
   if (rect_empty(ob_full)) return;
 
-  // Build layer-local buffer
   layer_buf buf;
   buf.resize((uint32_t)M.vp_w, (uint32_t)M.vp_h);
-
-  // Rasterize (scale) from source into buf (no opacity/invertRel yet, filters independent)
   for (int32_t lvy=0; lvy<M.vp_h; lvy++) {
     uint32_t syi = M.sr.y + (uint32_t)M.y_map[(size_t)lvy];
     uint32_t *dst = &buf.px[(size_t)lvy*(size_t)buf.w];
-#if HAVE_NEON
-    // Not doing a complicated SIMD gather here; keep scalar for correctness
-#endif
+    if (syi >= sf.in_h) { std::fill(dst, dst + buf.w, 0xFF000000u); continue; }
     for (int32_t lvx=0; lvx<M.vp_w; lvx++) {
       uint32_t sxi = M.sr.x + (uint32_t)M.x_map[(size_t)lvx];
-      dst[(size_t)lvx] = sample_rgb24_xrgb(job.src_rgb, job.src_stride, sxi, syi, bgr);
+      if (sxi >= sf.in_w) { dst[(size_t)lvx] = 0xFF000000u; continue; }
+      dst[(size_t)lvx] = sample_rgb24_xrgb(sf.src_rgb, sf.src_stride, sxi, syi, bgr);
     }
   }
-
-  // Apply per-layer filter chain
   apply_filter_chain(buf, L.filters);
 
-  // Now composite into output in this worker's band only (y0..y1)
   rect_i32 ob_band = clamp_bounds_to_output_and_band(ob, job.out_w, job.out_h, y0, y1);
   if (rect_empty(ob_band)) return;
-
   const uint8_t layer_a = M.alpha;
   if (layer_a == 0) return;
 
@@ -1284,31 +1285,23 @@ static void composite_video_filtered_rows(const comp_job &job,
     if ((uint32_t)lvy >= (uint32_t)M.vp_h) continue;
     uint32_t *drow = (uint32_t*)(job.dst_xrgb + (uint64_t)oy * job.dst_stride);
     const uint32_t *urow = upper_buf ? (upper_buf + (size_t)oy*(size_t)job.out_w) : nullptr;
-
     const uint32_t *srcRow = &buf.px[(size_t)lvy*(size_t)buf.w];
-
     for (int32_t ox=ob_band.x0; ox<ob_band.x1; ox++) {
       int32_t vx = lut.ox_to_vx[(uint32_t)ox];
       if (vx < 0) continue;
       int32_t lvx = vx - M.dst_x;
       if ((uint32_t)lvx >= (uint32_t)M.vp_w) continue;
-
       uint32_t over = srcRow[(size_t)lvx];
-
-      // If filter produced alpha (sobel edgesOnly), incorporate it with layer opacity.
       uint8_t over_a = (uint8_t)((over >> 24) & 0xFF);
       if (over_a == 0) continue;
       uint8_t final_a = (uint8_t)((uint32_t)over_a * (uint32_t)layer_a / 255u);
 
-      // Apply invertRel at composite stage (kept consistent with non-filter path)
       if (M.inv == INV_LOWER) {
         over = invert_xrgb8888(drow[(uint32_t)ox]) | (over & 0xFF000000u);
       } else if (M.inv == INV_UPPER) {
         uint32_t base = urow ? urow[(uint32_t)ox] : 0xFF000000u;
         over = invert_xrgb8888(base) | (over & 0xFF000000u);
       }
-
-      // Blend using final_a, but over's RGB from filtered buffer
       uint32_t rgb = over & 0x00FFFFFFu;
       uint32_t over_xrgb = 0xFF000000u | rgb;
       drow[(uint32_t)ox] = blend_over_xrgb(drow[(uint32_t)ox], over_xrgb, final_a);
@@ -1319,7 +1312,6 @@ static void composite_video_filtered_rows(const comp_job &job,
 static void composite_layers_rows_optimized(const comp_job &job, uint32_t y0, uint32_t y1) {
   const auto &layers = *job.layers;
   const auto &maps = *job.layer_maps;
-
   clear_xrgb_rows_fast(job.dst_xrgb, job.dst_stride, job.out_w, y0, y1);
 
   for (size_t li=0; li<layers.size(); li++) {
@@ -1341,14 +1333,17 @@ static void composite_layers_rows_optimized(const comp_job &job, uint32_t y0, ui
     }
 
     if (L.type != LAYER_VIDEO) continue;
+
+    int src_idx = -1;
+    if (job.layer_source_index && li < job.layer_source_index->size()) src_idx = (*job.layer_source_index)[li];
+    const comp_job::source_frame *sf = job_find_source(job, src_idx);
+    if (!sf) continue;
+
     const layer_map_cache &M = maps[li];
     if (!M.enabled) continue;
 
-    if (!L.filters.empty()) {
-      composite_video_filtered_rows(job, L, M, upper_buf, y0, y1);
-    } else {
-      composite_video_direct_rows(job, L, M, upper_buf, y0, y1);
-    }
+    if (!L.filters.empty()) composite_video_filtered_rows(job, L, M, upper_buf, y0, y1, *sf);
+    else composite_video_direct_rows(job, L, M, upper_buf, y0, y1, *sf);
   }
 }
 
@@ -1427,6 +1422,7 @@ static void comp_pool_run(const comp_job &job_in) {
 // ---------------- Config + JSON ----------------
 struct persisted_config {
   std::string v4l2_dev="/dev/video0";
+  std::vector<std::string> v4l2_sources{};
   std::string edid_path;
   bool do_modeset=false;
   int threads=0;
@@ -1444,7 +1440,6 @@ struct persisted_config {
 static json filter_registry_json() {
   json j;
   json filters = json::array();
-
   {
     json f;
     f["id"] = "mono";
@@ -1459,14 +1454,31 @@ static json filter_registry_json() {
     f["params"] = { {"mode","edgesOnly"}, {"threshold",64}, {"alpha",1.0}, {"invert",false} };
     filters.push_back(f);
   }
-
   j["filters"] = filters;
   return j;
 }
 
-static std::string config_to_json(const persisted_config &c) {
+static void cfg_ensure_sources(persisted_config &c) {
+  if (c.v4l2_sources.empty()) {
+    if (!c.v4l2_dev.empty()) c.v4l2_sources.push_back(c.v4l2_dev);
+  }
+  std::vector<std::string> out;
+  for (auto &s : c.v4l2_sources) {
+    if (s.empty()) continue;
+    if (std::find(out.begin(), out.end(), s) == out.end()) out.push_back(s);
+  }
+  c.v4l2_sources.swap(out);
+  if (c.v4l2_sources.empty()) c.v4l2_sources.push_back("/dev/video0");
+  if (c.v4l2_dev.empty()) c.v4l2_dev = c.v4l2_sources[0];
+}
+
+static std::string config_to_json(const persisted_config &c_in) {
+  persisted_config c = c_in;
+  cfg_ensure_sources(c);
+
   json j;
   j["v4l2Dev"] = c.v4l2_dev;
+  j["v4l2Sources"] = c.v4l2_sources;
   j["edidPath"] = c.edid_path;
   j["modesetMatchInput"] = c.do_modeset;
   j["threads"] = c.threads;
@@ -1492,8 +1504,8 @@ static std::string config_to_json(const persisted_config &c) {
       sc << L.scale_x << "," << L.scale_y;
       jl["scale"] = sc.str();
     }
+    if (L.type == LAYER_VIDEO) jl["videoSource"] = L.video_source;
 
-    // filters (video only; always include array for stability)
     json fl = json::array();
     if (L.type == LAYER_VIDEO) {
       for (const auto &F : L.filters) {
@@ -1518,7 +1530,6 @@ static std::string config_to_json(const persisted_config &c) {
     }
     jl["filters"] = fl;
 
-    // crosshair (kept)
     json xh;
     xh["enabled"] = L.xh.enabled;
     xh["diam"] = std::to_string(L.xh.diam_w) + "x" + std::to_string(L.xh.diam_h);
@@ -1553,11 +1564,9 @@ static bool config_from_json_text(const std::string &text, persisted_config &c) 
   get_bool("modesetMatchInput", c.do_modeset);
   get_int("threads", c.threads);
   get_bool("bgr", c.input_is_bgr);
-
   std::string present;
   get_str("present", present);
   if (!present.empty() && present_policy_valid(present)) c.present_policy = present;
-
   get_bool("preferOutputMode", c.prefer_output_mode);
   std::string preferRes;
   get_str("preferOutputRes", preferRes);
@@ -1572,8 +1581,12 @@ static bool config_from_json_text(const std::string &text, persisted_config &c) 
     uint32_t w=0,h=0;
     if (parse_dim(viewport.c_str(), &w,&h)) { c.viewport.set=true; c.viewport.w=w; c.viewport.h=h; }
   }
-
   get_str("listenAddr", c.listen_addr);
+
+  if (j.contains("v4l2Sources") && j["v4l2Sources"].is_array()) {
+    c.v4l2_sources.clear();
+    for (const auto &x : j["v4l2Sources"]) if (x.is_string()) c.v4l2_sources.push_back(x.get<std::string>());
+  }
 
   if (j.contains("layers") && j["layers"].is_array()) {
     c.layers.clear();
@@ -1586,9 +1599,12 @@ static bool config_from_json_text(const std::string &text, persisted_config &c) 
       else if (type=="graphics") L.type = LAYER_GRAPHICS;
       else L.type = LAYER_VIDEO;
 
+      if (L.type == LAYER_VIDEO && jl.contains("videoSource") && jl["videoSource"].is_string()) {
+        L.video_source = jl["videoSource"].get<std::string>();
+      }
+
       L.enabled = jl.value("enabled", true);
       L.opacity = (float)std::clamp(jl.value("opacity", 1.0), 0.0, 1.0);
-
       std::string inv = jl.value("invertRel", "none");
       if (inv=="lower") L.invert_rel = INV_LOWER;
       else if (inv=="upper") L.invert_rel = INV_UPPER;
@@ -1613,8 +1629,6 @@ static bool config_from_json_text(const std::string &text, persisted_config &c) 
           L.scale_x=(float)sx; L.scale_y=(float)sy;
         }
       }
-
-      // filters
       if (jl.contains("filters") && jl["filters"].is_array() && L.type == LAYER_VIDEO) {
         for (const auto &jf : jl["filters"]) {
           if (!jf.is_object()) continue;
@@ -1646,8 +1660,6 @@ static bool config_from_json_text(const std::string &text, persisted_config &c) 
           L.filters.push_back(fc);
         }
       }
-
-      // crosshair
       if (jl.contains("crosshair") && jl["crosshair"].is_object()) {
         const auto &xh = jl["crosshair"];
         L.xh.enabled = xh.value("enabled", false);
@@ -1673,10 +1685,10 @@ static bool config_from_json_text(const std::string &text, persisted_config &c) 
         else if (xin=="upper") L.xh.invert_rel = INV_UPPER;
         else L.xh.invert_rel = INV_NONE;
       }
-
       c.layers.push_back(L);
     }
   }
+  cfg_ensure_sources(c);
   return true;
 }
 
@@ -1688,7 +1700,6 @@ static std::atomic<bool> g_quit{false};
 static std::atomic<bool> g_reinit_requested{false};
 static std::mutex g_reinit_mtx;
 static std::string g_reinit_reason;
-
 static void request_reinit(const std::string &reason) {
   { std::lock_guard<std::mutex> lk(g_reinit_mtx); g_reinit_reason = reason; }
   g_reinit_requested.store(true);
@@ -1699,7 +1710,9 @@ static std::string take_reinit_reason() {
 }
 static persisted_config cfg_snapshot() {
   std::lock_guard<std::mutex> lk(g_cfg_mtx);
-  return g_cfg;
+  persisted_config c = g_cfg;
+  cfg_ensure_sources(c);
+  return c;
 }
 static bool save_config_locked() {
   std::string j = config_to_json(g_cfg);
@@ -1785,7 +1798,7 @@ static std::vector<uint8_t> rgb24_to_png_uncompressed(const uint8_t *rgb, uint32
   return out;
 }
 
-// ---------------- Capture publishing ----------------
+// ---------------- Multi-source capture ----------------
 struct latest_frame {
   const uint8_t *ptr=nullptr;
   uint32_t stride=0;
@@ -1793,12 +1806,9 @@ struct latest_frame {
   uint32_t buf_index=0;
   bool valid=false;
 };
-static std::mutex g_latest_mtx;
-static latest_frame g_latest;
-static std::atomic<uint64_t> g_latest_seq{0};
 
-// ---------------- Pipeline ----------------
-struct pipeline {
+struct source_capture {
+  std::string dev;
   bool have_held_buf=false;
   struct v4l2_buffer held_buf{};
   int vfd=-1;
@@ -1808,7 +1818,159 @@ struct pipeline {
   uint32_t dv_w=0,dv_h=0;
   uint64_t last_dv_check_ms=0;
   uint64_t dv_check_interval_ms=500;
+  bool dumped=false;
 
+  latest_frame latest{};
+  std::mutex latest_mtx;
+  std::atomic<uint64_t> latest_seq{0};
+
+  source_probe last_probe{};
+  std::mutex probe_mtx;
+
+  source_capture() = default;
+  source_capture(const source_capture&) = delete;
+  source_capture& operator=(const source_capture&) = delete;
+  source_capture(source_capture&&) = delete;
+  source_capture& operator=(source_capture&&) = delete;
+
+  bool init(const persisted_config &cfg, const std::string &dev_path) {
+    dev = dev_path;
+    fprintf(stderr, "[source] init %s\n", dev.c_str());
+    vfd = v4l2_open(dev.c_str(), O_RDWR | O_NONBLOCK, 0);
+    if (vfd < 0) { perror("v4l2_open"); return false; }
+
+    if (!cfg.edid_path.empty()) {
+      (void)v4l2_set_edid_if_requested(vfd, cfg.edid_path.c_str());
+      usleep(1500*1000);
+    }
+
+    uint64_t pixelclock=0;
+    dv_w=dv_h=0;
+    if (tc358743_query_and_set_dv_timings(vfd, &dv_w, &dv_h, &pixelclock, true) != 0) {
+      fprintf(stderr, "[source] %s: no DV timings (no signal?)\n", dev.c_str());
+      return false;
+    }
+    if (tc358743_set_pixfmt_rgb24(vfd, &in_w, &in_h, &in_stride) != 0) return false;
+    if (v4l2_start_mmap_capture(vfd, &cbufs, &cbuf_count) != 0) return false;
+
+    have_held_buf=false;
+    memset(&held_buf, 0, sizeof(held_buf));
+    dumped=false;
+    {
+      std::lock_guard<std::mutex> lk(latest_mtx);
+      latest = {};
+      latest.valid=false;
+    }
+    latest_seq.store(0);
+
+    {
+      std::lock_guard<std::mutex> lk(probe_mtx);
+      last_probe = probe_v4l2_source(dev);
+    }
+    return true;
+  }
+
+  void shutdown() {
+    have_held_buf=false;
+    memset(&held_buf, 0, sizeof(held_buf));
+    if (vfd>=0) {
+      v4l2_stop_and_unmap(vfd, cbufs, cbuf_count);
+      cbufs=nullptr; cbuf_count=0;
+      v4l2_close(vfd);
+      vfd=-1;
+    }
+    {
+      std::lock_guard<std::mutex> lk(latest_mtx);
+      latest = {};
+      latest.valid=false;
+    }
+    latest_seq.store(0);
+  }
+
+  bool detect_input_change_and_request_reinit(std::string &out_reason) {
+    uint32_t cur_w=0,cur_h=0,cur_stride=0,cur_pixfmt=0;
+    if (v4l2_get_current_fmt(vfd, &cur_w,&cur_h,&cur_stride,&cur_pixfmt)==0) {
+      if (cur_w && cur_h && (cur_w!=in_w || cur_h!=in_h || cur_stride!=in_stride)) {
+        out_reason = "input resolution changed (VIDIOC_G_FMT) on " + dev;
+        return true;
+      }
+    }
+    uint64_t now=monotonic_ms();
+    if ((now-last_dv_check_ms) < dv_check_interval_ms) return false;
+    last_dv_check_ms = now;
+    uint32_t tw=0,th=0; uint64_t pc=0;
+    if (tc358743_query_dv_timings(vfd, &tw,&th,&pc)==0) {
+      if (tw && th && (tw!=dv_w || th!=dv_h)) {
+        out_reason = "input resolution changed (DV timings) on " + dev;
+        return true;
+      }
+    } else {
+      out_reason = "DV timings unavailable (signal lost?) on " + dev;
+      return true;
+    }
+    return false;
+  }
+
+  bool step_capture_publish_blocking(int timeout_ms, bool *got_new_frame) {
+    if (got_new_frame) *got_new_frame = false;
+    uint64_t before_seq = latest_seq.load(std::memory_order_acquire);
+
+    int prc = v4l2_wait_for_frame(vfd, timeout_ms);
+    if (prc < 0) return false;
+    if (prc == 0) return true;
+
+    struct v4l2_buffer b;
+    int dq=v4l2_dequeue_latest_frame(vfd, &b);
+    if (dq==1) return true;
+    if (dq<0) return false;
+
+    const uint8_t *src = (const uint8_t*)cbufs[b.index].start;
+    if (!dumped) { dump_first_pixels_rgb24(src); dumped=true; }
+
+    if (have_held_buf) (void)v4l2_queue_frame(vfd, &held_buf);
+    held_buf = b;
+    have_held_buf = true;
+
+    {
+      std::lock_guard<std::mutex> lk(latest_mtx);
+      latest.ptr=src;
+      latest.stride=in_stride;
+      latest.w=in_w; latest.h=in_h;
+      latest.buf_index=b.index;
+      latest.valid=true;
+    }
+    latest_seq.fetch_add(1, std::memory_order_release);
+
+    uint64_t after_seq = latest_seq.load(std::memory_order_acquire);
+    if (got_new_frame && after_seq != before_seq) *got_new_frame = true;
+
+    // update probe snapshot periodically (simple open+query)
+    static const uint64_t kProbeEveryMs = 1000;
+    static thread_local uint64_t last_probe_ms = 0;
+    uint64_t now = monotonic_ms();
+    if (now - last_probe_ms >= kProbeEveryMs) {
+      last_probe_ms = now;
+      source_probe p = probe_v4l2_source(dev);
+      std::lock_guard<std::mutex> lk(probe_mtx);
+      last_probe = p;
+    }
+    return true;
+  }
+
+  latest_frame latest_snapshot(uint64_t *seq_out=nullptr) {
+    if (seq_out) *seq_out = latest_seq.load(std::memory_order_acquire);
+    std::lock_guard<std::mutex> lk(latest_mtx);
+    return latest;
+  }
+
+  source_probe probe_snapshot() {
+    std::lock_guard<std::mutex> lk(probe_mtx);
+    return last_probe;
+  }
+};
+
+// ---------------- Pipeline ----------------
+struct pipeline {
   int drm_fd=-1;
   drmModeConnector *conn=nullptr;
   uint32_t conn_id=0;
@@ -1816,20 +1978,23 @@ struct pipeline {
   uint32_t plane_id=0;
   uint32_t p_fb_id=0,p_crtc_id=0,p_crtc_x=0,p_crtc_y=0,p_crtc_w=0,p_crtc_h=0;
   uint32_t p_src_x=0,p_src_y=0,p_src_w=0,p_src_h=0;
-
   dumb_fb fb[2];
   int cur=0;
   invert_upper_cache upper_cache{};
   int comp_threads=0;
-  bool dumped=false;
   bool saw_frame=false;
+
+  // NOTE: use pointers to keep source_capture non-movable/non-copyable
+  std::vector<std::unique_ptr<source_capture>> sources;
 
   std::vector<layer_cfg> layers_work_;
   std::vector<layer_map_cache> layer_maps_;
   out_to_vp_lut lut_;
-  uint64_t last_rendered_seq = 0;
+  std::vector<int> layer_source_index_;
+  uint64_t last_rendered_seq_any = 0;
 
-  bool init_from_config(const persisted_config &cfg) {
+  bool init_from_config(persisted_config cfg) {
+    cfg_ensure_sources(cfg);
     memset(&fb[0],0,sizeof(fb[0]));
     memset(&fb[1],0,sizeof(fb[1]));
 
@@ -1840,21 +2005,22 @@ struct pipeline {
     if (comp_threads<1) comp_threads=1;
     if (comp_threads>cpu_count) comp_threads=cpu_count;
 
-    fprintf(stderr, "[pipeline] init v4l2=%s threads=%d\n", cfg.v4l2_dev.c_str(), comp_threads);
+    fprintf(stderr, "[pipeline] init threads=%d sources=%zu\n", comp_threads, cfg.v4l2_sources.size());
 
-    vfd = v4l2_open(cfg.v4l2_dev.c_str(), O_RDWR | O_NONBLOCK, 0);
-    if (vfd < 0) { perror("v4l2_open"); return false; }
-
-    if (!cfg.edid_path.empty()) {
-      (void)v4l2_set_edid_if_requested(vfd, cfg.edid_path.c_str());
-      usleep(1500*1000);
+    sources.clear();
+    for (const auto &dev : cfg.v4l2_sources) {
+      if (dev.empty()) continue;
+      auto cap = std::make_unique<source_capture>();
+      if (cap->init(cfg, dev)) {
+        sources.push_back(std::move(cap));
+      } else {
+        fprintf(stderr, "[pipeline] source %s not active; skipping capture init\n", dev.c_str());
+      }
     }
-
-    uint64_t pixelclock=0;
-    dv_w=dv_h=0;
-    if (tc358743_query_and_set_dv_timings(vfd, &dv_w, &dv_h, &pixelclock, true) != 0) return false;
-    if (tc358743_set_pixfmt_rgb24(vfd, &in_w, &in_h, &in_stride) != 0) return false;
-    if (v4l2_start_mmap_capture(vfd, &cbufs, &cbuf_count) != 0) return false;
+    if (sources.empty()) {
+      fprintf(stderr, "[pipeline] no active sources; init failed\n");
+      return false;
+    }
 
     drm_fd = open_vc4_card();
     if (drm_fd < 0) { perror("open_vc4_card"); return false; }
@@ -1862,20 +2028,20 @@ struct pipeline {
     if (find_hdmi_a_1(drm_fd, &conn_id, &conn) != 0) return false;
     if (conn->connection != DRM_MODE_CONNECTED) return false;
     if (get_active_crtc_for_connector(drm_fd, conn, &crtc_id, &crtc_index, &out_w, &out_h) != 0) return false;
-
     if (cfg.prefer_output_mode) {
       (void)drm_modeset_prefer(drm_fd, conn_id, conn, crtc_id, cfg.prefer_out_w, cfg.prefer_out_h, 60.0);
       (void)get_active_crtc_for_connector(drm_fd, conn, &crtc_id, &crtc_index, &out_w, &out_h);
     }
     if (cfg.do_modeset) {
-      (void)drm_modeset_match_input(drm_fd, conn_id, conn, crtc_id, in_w, in_h);
+      uint32_t inw = sources[0]->in_w;
+      uint32_t inh = sources[0]->in_h;
+      (void)drm_modeset_match_input(drm_fd, conn_id, conn, crtc_id, inw, inh);
       (void)get_active_crtc_for_connector(drm_fd, conn, &crtc_id, &crtc_index, &out_w, &out_h);
     }
 
     const uint32_t fmt=DRM_FORMAT_XRGB8888;
     plane_id = find_primary_plane_on_crtc(drm_fd, crtc_index, fmt);
     if (!plane_id) return false;
-
     p_fb_id   = get_prop_id(drm_fd, plane_id, DRM_MODE_OBJECT_PLANE, "FB_ID");
     p_crtc_id = get_prop_id(drm_fd, plane_id, DRM_MODE_OBJECT_PLANE, "CRTC_ID");
     p_crtc_x  = get_prop_id(drm_fd, plane_id, DRM_MODE_OBJECT_PLANE, "CRTC_X");
@@ -1902,29 +2068,19 @@ struct pipeline {
                                  fb[0].fb_id, &scanout) != 0) return false;
 
     if (comp_pool_init(comp_threads, out_h) != 0) return false;
-
     upper_cache.init(out_w, out_h, 0);
     cur=0;
-    dumped=false;
     saw_frame=false;
-    have_held_buf=false;
-    memset(&held_buf, 0, sizeof(held_buf));
     layers_work_.clear();
     layer_maps_.clear();
     lut_ = {};
-    {
-      std::lock_guard<std::mutex> lk(g_latest_mtx);
-      g_latest = {};
-      g_latest.valid=false;
-    }
-    g_latest_seq.store(0);
-    last_rendered_seq = 0;
+    layer_source_index_.clear();
+    last_rendered_seq_any = 0;
     return true;
   }
 
   void shutdown() {
     if (g_comp_workers > 0) comp_pool_destroy();
-
     if (drm_fd>=0 && plane_id) {
       drmModeAtomicReq *off = drmModeAtomicAlloc();
       if (off) {
@@ -1938,98 +2094,69 @@ struct pipeline {
       dumb_fb_destroy(drm_fd, &fb[0]);
       dumb_fb_destroy(drm_fd, &fb[1]);
     }
-
-    have_held_buf=false;
-    memset(&held_buf, 0, sizeof(held_buf));
-
-    if (vfd>=0) {
-      v4l2_stop_and_unmap(vfd, cbufs, cbuf_count);
-      cbufs=nullptr; cbuf_count=0;
-      v4l2_close(vfd);
-      vfd=-1;
-    }
+    for (auto &s : sources) if (s) s->shutdown();
+    sources.clear();
     if (conn) { drmModeFreeConnector(conn); conn=nullptr; }
     if (drm_fd>=0) { close(drm_fd); drm_fd=-1; }
   }
 
   bool detect_input_change_and_request_reinit() {
-    uint32_t cur_w=0,cur_h=0,cur_stride=0,cur_pixfmt=0;
-    if (v4l2_get_current_fmt(vfd, &cur_w,&cur_h,&cur_stride,&cur_pixfmt)==0) {
-      if (cur_w && cur_h && (cur_w!=in_w || cur_h!=in_h || cur_stride!=in_stride)) {
-        request_reinit("input resolution changed (VIDIOC_G_FMT)");
-        return true;
-      }
-    }
-    uint64_t now=monotonic_ms();
-    if ((now-last_dv_check_ms) < dv_check_interval_ms) return false;
-    last_dv_check_ms = now;
-    uint32_t tw=0,th=0; uint64_t pc=0;
-    if (tc358743_query_dv_timings(vfd, &tw,&th,&pc)==0) {
-      if (tw && th && (tw!=dv_w || th!=dv_h)) {
-        request_reinit("input resolution changed (DV timings)");
+    for (auto &s : sources) {
+      std::string reason;
+      if (s && s->detect_input_change_and_request_reinit(reason)) {
+        request_reinit(reason);
         return true;
       }
     }
     return false;
   }
 
-  bool step_capture_publish_blocking(int timeout_ms, bool *got_new_frame) {
-    if (got_new_frame) *got_new_frame = false;
-    uint64_t before_seq = g_latest_seq.load(std::memory_order_acquire);
-
-    int prc = v4l2_wait_for_frame(vfd, timeout_ms);
-    if (prc < 0) return false;
-    if (prc == 0) return true;
-
-    struct v4l2_buffer b;
-    int dq=v4l2_dequeue_latest_frame(vfd, &b);
-    if (dq==1) return true;
-    if (dq<0) return false;
-
-    const uint8_t *src = (const uint8_t*)cbufs[b.index].start;
-    if (!dumped) { dump_first_pixels_rgb24(src); dumped=true; }
-
-    if (have_held_buf) (void)v4l2_queue_frame(vfd, &held_buf);
-    held_buf = b;
-    have_held_buf = true;
-
-    {
-      std::lock_guard<std::mutex> lk(g_latest_mtx);
-      g_latest.ptr=src;
-      g_latest.stride=in_stride;
-      g_latest.w=in_w; g_latest.h=in_h;
-      g_latest.buf_index=b.index;
-      g_latest.valid=true;
+  bool step_capture_publish_blocking(int timeout_ms, bool *got_any_new) {
+    if (got_any_new) *got_any_new = false;
+    bool any=false;
+    for (auto &s : sources) {
+      if (!s) continue;
+      bool got=false;
+      if (!s->step_capture_publish_blocking(timeout_ms, &got)) return false;
+      if (got) any=true;
     }
-    g_latest_seq.fetch_add(1, std::memory_order_release);
-    uint64_t after_seq = g_latest_seq.load(std::memory_order_acquire);
-    if (got_new_frame && after_seq != before_seq) *got_new_frame = true;
+    if (got_any_new) *got_any_new = any;
     return true;
   }
 
-  void build_upper_cache_fast(const latest_frame &lf, const present_rect &map_pr, uint32_t vpw, uint32_t vph, const persisted_config &cfg_live) {
-    // Upper cache currently does NOT incorporate filtered outputs.
-    // This keeps it simple and cheap; INV_UPPER with filtered layers will invert against
-    // the "unfiltered upper composite". If you need perfect semantics later, we can extend it.
+  int resolve_layer_source_index(const persisted_config &cfg_live, const layer_cfg &L, std::string &resolved_dev, bool &active) {
+    std::string req = L.video_source.empty() ? cfg_live.v4l2_dev : L.video_source;
+    if (req.empty()) req = cfg_live.v4l2_dev;
+    resolved_dev = req;
+    active = false;
+
+    for (size_t i=0;i<sources.size();i++) {
+      if (!sources[i]) continue;
+      if (sources[i]->dev == req) {
+        source_probe p = sources[i]->probe_snapshot();
+        active = p.active;
+        if (!active) return -1;
+        return (int)i;
+      }
+    }
+    return -1;
+  }
+
+  void build_upper_cache_fast_single_source(const latest_frame &lf, const present_rect &map_pr, uint32_t vpw, uint32_t vph, const persisted_config &cfg_live) {
     upper_cache.enabled = true;
     std::fill(upper_cache.running_upper.begin(), upper_cache.running_upper.end(), 0xFF000000u);
     upper_cache.clear_upper_of_layer_buffers();
-
     out_to_vp_lut ulut;
     ulut.rebuild(out_w, out_h, vpw, vph, map_pr);
-
     std::vector<layer_map_cache> umaps(layers_work_.size());
     for (size_t i=0;i<layers_work_.size();i++) umaps[i].build_from_layer(layers_work_[i], lf.w, lf.h);
-
     for (int li=(int)layers_work_.size()-1; li>=0; li--) {
       const layer_cfg &L = layers_work_[(size_t)li];
       bool wants=false;
       if (L.enabled && L.type==LAYER_VIDEO && L.invert_rel==INV_UPPER) wants=true;
       if (L.enabled && L.type==LAYER_CROSSHAIR && L.xh.enabled && L.xh.invert_rel==INV_UPPER) wants=true;
       if (wants) upper_cache.upper_of_layer[(size_t)li] = upper_cache.running_upper;
-
       if (!L.enabled) continue;
-
       if (L.type == LAYER_CROSSHAIR) {
         uint8_t a = (uint8_t)std::lround(std::clamp(L.xh.opacity, 0.0f, 1.0f) * 255.0f);
         if (a==0) continue;
@@ -2037,17 +2164,16 @@ struct pipeline {
                                    L.xh, INV_NONE, a, 0, out_h, nullptr);
         continue;
       }
-
       if (L.type != LAYER_VIDEO) continue;
+      if ((size_t)li >= layer_source_index_.size() || layer_source_index_[(size_t)li] != 0) continue;
+
       const layer_map_cache &M = umaps[(size_t)li];
       if (!M.enabled) continue;
       uint8_t a = M.alpha;
       if (a == 0) continue;
-
       rect_i32 ob = layer_vp_rect_to_output_bounds(map_pr, vpw, vph, M.dst_x, M.dst_y, M.vp_w, M.vp_h);
       ob = clamp_bounds_to_output_and_band(ob, out_w, out_h, 0, out_h);
       if (rect_empty(ob)) continue;
-
       for (int32_t oy=ob.y0; oy<ob.y1; oy++) {
         int32_t vy = ulut.oy_to_vy[(uint32_t)oy];
         if (vy < 0) continue;
@@ -2068,20 +2194,44 @@ struct pipeline {
     }
   }
 
-  bool step_render_present_if_new(const persisted_config &cfg_live) {
-    uint64_t seq = g_latest_seq.load(std::memory_order_acquire);
-    if (seq == 0 || seq == last_rendered_seq) return true;
+  bool step_render_present_if_new(const persisted_config &cfg_live_in) {
+    persisted_config cfg_live = cfg_live_in;
+    cfg_ensure_sources(cfg_live);
 
-    latest_frame lf;
-    {
-      std::lock_guard<std::mutex> lk(g_latest_mtx);
-      lf = g_latest;
+    uint64_t any_seq = 0;
+    for (auto &s : sources) if (s) any_seq ^= s->latest_seq.load(std::memory_order_acquire);
+    if (any_seq == 0 || any_seq == last_rendered_seq_any) return true;
+
+    std::vector<comp_job::source_frame> sframes;
+    sframes.reserve(sources.size());
+    for (auto &s : sources) {
+      comp_job::source_frame sf;
+      if (s) {
+        sf.dev = s->dev;
+        latest_frame lf = s->latest_snapshot();
+        if (lf.valid && lf.ptr) {
+          sf.src_rgb = lf.ptr;
+          sf.src_stride = lf.stride;
+          sf.in_w = lf.w;
+          sf.in_h = lf.h;
+          sf.valid = true;
+        }
+      }
+      sframes.push_back(sf);
     }
-    if (!lf.valid || !lf.ptr) return true;
 
-    uint32_t vpw=lf.w, vph=lf.h;
+    latest_frame lf0{};
+    bool have0=false;
+    for (auto &s : sources) {
+      if (!s) continue;
+      latest_frame lf = s->latest_snapshot();
+      if (lf.valid && lf.ptr) { lf0 = lf; have0=true; break; }
+    }
+    if (!have0) return true;
+
+    uint32_t vpw=lf0.w, vph=lf0.h;
     if (cfg_live.viewport.set) { vpw=cfg_live.viewport.w; vph=cfg_live.viewport.h; }
-    if (!vpw || !vph) { vpw=lf.w; vph=lf.h; }
+    if (!vpw || !vph) { vpw=lf0.w; vph=lf0.h; }
 
     layers_work_ = cfg_live.layers;
     if (layers_work_.empty()) {
@@ -2089,25 +2239,63 @@ struct pipeline {
       L.name="FullFrame";
       L.type=LAYER_VIDEO;
       L.enabled=true;
-      L.src_rect={0,0,lf.w,lf.h};
+      L.src_rect={0,0,lf0.w,lf0.h};
       L.dst_pos={0,0};
       L.scale_x=1.0f; L.scale_y=1.0f;
       L.opacity=1.0f;
       L.invert_rel=INV_NONE;
+      L.video_source = cfg_live.v4l2_dev;
       layers_work_.push_back(L);
-      vpw=lf.w; vph=lf.h;
+      vpw=lf0.w; vph=lf0.h;
     }
     for (auto &L : layers_work_) {
       if (L.type == LAYER_CROSSHAIR) L.xh.enabled = L.enabled;
     }
 
-    upper_cache.ensure_layer_count(layers_work_.size());
+    layer_source_index_.assign(layers_work_.size(), -1);
+    std::vector<runtime_info::layer_rt> layer_rt(layers_work_.size());
+    for (size_t i=0;i<layers_work_.size();i++) {
+      const auto &L = layers_work_[i];
+      if (L.type != LAYER_VIDEO) {
+        layer_rt[i] = { "", "", true };
+        continue;
+      }
+      std::string resolved;
+      bool active=false;
+      int idx = resolve_layer_source_index(cfg_live, L, resolved, active);
+      layer_source_index_[i] = idx;
+      layer_rt[i].requested = L.video_source.empty() ? cfg_live.v4l2_dev : L.video_source;
+      layer_rt[i].resolved = resolved;
+      layer_rt[i].active = (idx >= 0) && active;
+    }
 
-    bool need_upper=false;
-    for (auto &L : layers_work_) {
-      if (!L.enabled) continue;
-      if (L.invert_rel == INV_UPPER) need_upper=true;
-      if (L.type==LAYER_CROSSHAIR && L.xh.enabled && L.xh.invert_rel==INV_UPPER) need_upper=true;
+    std::vector<runtime_info::source_rt> sources_rt;
+    sources_rt.reserve(cfg_live.v4l2_sources.size());
+    for (const auto &dev : cfg_live.v4l2_sources) {
+      runtime_info::source_rt sr;
+      sr.dev = dev;
+      bool found=false;
+      for (auto &s : sources) {
+        if (s && s->dev == dev) {
+          source_probe p = s->probe_snapshot();
+          sr.present = p.present;
+          sr.active = p.active;
+          sr.dv_w = p.dv_w; sr.dv_h = p.dv_h; sr.pixelclock = p.pixelclock;
+          sr.fmt_w = p.fmt_w; sr.fmt_h = p.fmt_h; sr.stride = p.stride; sr.pixfmt = p.pixfmt;
+          sr.err = p.err;
+          found=true;
+          break;
+        }
+      }
+      if (!found) {
+        source_probe p = probe_v4l2_source(dev);
+        sr.present = p.present;
+        sr.active = p.active;
+        sr.dv_w = p.dv_w; sr.dv_h = p.dv_h; sr.pixelclock = p.pixelclock;
+        sr.fmt_w = p.fmt_w; sr.fmt_h = p.fmt_h; sr.stride = p.stride; sr.pixfmt = p.pixfmt;
+        sr.err = p.err;
+      }
+      sources_rt.push_back(sr);
     }
 
     present_rect map_pr = compute_present_rect(cfg_live.present_policy.c_str(), out_w, out_h, vpw, vph);
@@ -2119,6 +2307,8 @@ struct pipeline {
       g_rt.vph = vph;
       g_rt.pr = map_pr;
       g_rt.present_policy = cfg_live.present_policy;
+      g_rt.sources = sources_rt;
+      g_rt.layerSources = layer_rt;
     }
 
     lut_.rebuild(out_w, out_h, vpw, vph, map_pr);
@@ -2126,11 +2316,34 @@ struct pipeline {
     layer_maps_.resize(layers_work_.size());
     for (size_t i=0;i<layers_work_.size();i++) {
       if (layers_work_[i].type == LAYER_CROSSHAIR) { layer_maps_[i].enabled=false; continue; }
-      layer_maps_[i].build_from_layer(layers_work_[i], lf.w, lf.h);
+      int sidx = layer_source_index_[i];
+      if (sidx < 0 || (size_t)sidx >= sframes.size() || !sframes[(size_t)sidx].valid) {
+        layer_maps_[i].enabled=false;
+        continue;
+      }
+      layer_maps_[i].build_from_layer(layers_work_[i], sframes[(size_t)sidx].in_w, sframes[(size_t)sidx].in_h);
     }
 
+    upper_cache.ensure_layer_count(layers_work_.size());
+    bool need_upper=false;
+    for (auto &L : layers_work_) {
+      if (!L.enabled) continue;
+      if (L.invert_rel == INV_UPPER) need_upper=true;
+      if (L.type==LAYER_CROSSHAIR && L.xh.enabled && L.xh.invert_rel==INV_UPPER) need_upper=true;
+    }
     if (need_upper) {
-      build_upper_cache_fast(lf, map_pr, vpw, vph, cfg_live);
+      if (!sframes.empty() && sframes[0].valid) {
+        latest_frame lf;
+        lf.ptr = sframes[0].src_rgb;
+        lf.stride = sframes[0].src_stride;
+        lf.w = sframes[0].in_w;
+        lf.h = sframes[0].in_h;
+        lf.valid = true;
+        build_upper_cache_fast_single_source(lf, map_pr, vpw, vph, cfg_live);
+      } else {
+        upper_cache.enabled=false;
+        upper_cache.clear_upper_of_layer_buffers();
+      }
     } else {
       upper_cache.enabled=false;
       upper_cache.clear_upper_of_layer_buffers();
@@ -2138,9 +2351,7 @@ struct pipeline {
 
     int next = cur ^ 1;
     comp_job job{};
-    job.src_rgb=lf.ptr;
-    job.src_stride=lf.stride;
-    job.in_w=lf.w; job.in_h=lf.h;
+    job.sources = sframes;
     job.input_is_bgr=cfg_live.input_is_bgr;
     job.dst_xrgb=(uint8_t*)fb[next].map;
     job.dst_stride=fb[next].pitch;
@@ -2151,35 +2362,30 @@ struct pipeline {
     job.upper_cache = (need_upper ? &upper_cache : nullptr);
     job.lut = &lut_;
     job.layer_maps = &layer_maps_;
+    job.layer_source_index = &layer_source_index_;
     comp_pool_run(job);
 
     if (!saw_frame) { fprintf(stderr, "[pipeline] first composited frame\n"); saw_frame=true; }
     if (drm_plane_flip_fb_only(drm_fd, plane_id, p_fb_id, fb[next].fb_id) != 0) return false;
-
     cur=next;
-    last_rendered_seq = seq;
+    last_rendered_seq_any = any_seq;
     return true;
   }
 };
 
 // ---------------- Reference frame grabber ----------------
-static bool grab_one_frame_rgb24(int vfd, cap_buf *cbufs, uint32_t cbuf_count,
-                                 uint32_t in_stride, uint32_t in_w, uint32_t in_h,
-                                 std::vector<uint8_t> &out_rgb24) {
-  (void)cbuf_count;
+static bool grab_one_frame_rgb24_from_source(source_capture &src, std::vector<uint8_t> &out_rgb24) {
   uint64_t deadline = monotonic_ms() + 1000;
   while (monotonic_ms() < deadline) {
-    int prc = v4l2_wait_for_frame(vfd, 100);
-    if (prc <= 0) continue;
-    struct v4l2_buffer b;
-    int dq = v4l2_dequeue_latest_frame(vfd, &b);
-    if (dq != 0) continue;
-    const uint8_t *src = (const uint8_t*)cbufs[b.index].start;
-    out_rgb24.resize((size_t)in_w*(size_t)in_h*3);
-    for (uint32_t y=0;y<in_h;y++) {
-      memcpy(out_rgb24.data() + (size_t)y*(size_t)in_w*3, src + (uint64_t)y*in_stride, (size_t)in_w*3);
+    bool got=false;
+    if (!src.step_capture_publish_blocking(100, &got)) return false;
+    if (!got) continue;
+    latest_frame lf = src.latest_snapshot();
+    if (!lf.valid || !lf.ptr) continue;
+    out_rgb24.resize((size_t)lf.w*(size_t)lf.h*3);
+    for (uint32_t y=0;y<lf.h;y++) {
+      memcpy(out_rgb24.data() + (size_t)y*(size_t)lf.w*3, lf.ptr + (uint64_t)y*lf.stride, (size_t)lf.w*3);
     }
-    (void)v4l2_queue_frame(vfd, &b);
     return true;
   }
   return false;
@@ -2191,9 +2397,12 @@ static std::atomic<pid_t> g_pid{0};
 static std::string status_json() {
   bool ok=false; std::string err;
   get_last_apply(&ok, &err);
+
   uint32_t outw=0, outh=0, vpw=0, vph=0;
   present_rect pr{};
   std::string policy="fit";
+  std::vector<runtime_info::source_rt> sources;
+  std::vector<runtime_info::layer_rt> layerSources;
   {
     std::lock_guard<std::mutex> lk(g_rt.mtx);
     outw = g_rt.out_w;
@@ -2202,7 +2411,10 @@ static std::string status_json() {
     vph  = g_rt.vph;
     pr   = g_rt.pr;
     policy = g_rt.present_policy;
+    sources = g_rt.sources;
+    layerSources = g_rt.layerSources;
   }
+
   json j;
   j["pid"] = (int)g_pid.load();
   j["reinitRequested"] = g_reinit_requested.load();
@@ -2210,6 +2422,33 @@ static std::string status_json() {
   j["configPath"] = g_cfg_path;
   j["lastApplyOk"] = ok;
   j["lastApplyError"] = err;
+
+  json jsources = json::array();
+  for (auto &s : sources) {
+    json o;
+    o["dev"] = s.dev;
+    o["present"] = s.present;
+    o["active"] = s.active;
+    o["dvW"] = s.dv_w;
+    o["dvH"] = s.dv_h;
+    o["pixelclock"] = (uint64_t)s.pixelclock;
+    o["fmtW"] = s.fmt_w;
+    o["fmtH"] = s.fmt_h;
+    o["stride"] = s.stride;
+    o["pixfmt"] = s.pixfmt;
+    if (!s.err.empty()) o["err"] = s.err;
+    jsources.push_back(o);
+  }
+
+  json jls = json::array();
+  for (auto &ls : layerSources) {
+    json o;
+    o["requested"] = ls.requested;
+    o["resolved"] = ls.resolved;
+    o["active"] = ls.active;
+    jls.push_back(o);
+  }
+
   j["runtime"] = {
     {"outW", outw},
     {"outH", outh},
@@ -2223,15 +2462,19 @@ static std::string status_json() {
       {"crtcH", pr.crtc_h},
       {"srcW",  pr.src_w},
       {"srcH",  pr.src_h},
-    }}
+    }},
+    {"sources", jsources},
+    {"layerSources", jls},
   };
+
   return j.dump();
 }
 
-// apply_from_body updated: accepts/validates filters
+// apply_from_body updated: accepts/validates videoSource + v4l2Sources
 static bool apply_from_body(const std::string &body, std::string &out_json, int &out_http_status) {
   persisted_config cur = cfg_snapshot();
   persisted_config next = cur;
+
   json j = json::parse(body, nullptr, false);
   if (j.is_discarded() || !j.is_object()) {
     set_last_apply(false, "invalid json");
@@ -2239,6 +2482,7 @@ static bool apply_from_body(const std::string &body, std::string &out_json, int 
     out_json = "{\"error\":\"invalid json\"}";
     return false;
   }
+
   auto get_str = [&](const char *k, std::string &out) {
     if (j.contains(k) && j[k].is_string()) out = j[k].get<std::string>();
   };
@@ -2251,11 +2495,24 @@ static bool apply_from_body(const std::string &body, std::string &out_json, int 
 
   std::string s;
   get_str("v4l2Dev", s); if (!s.empty()) next.v4l2_dev = s;
+
+  if (j.contains("v4l2Sources")) {
+    if (!j["v4l2Sources"].is_array()) {
+      out_http_status=400; out_json="{\"error\":\"v4l2Sources must be array\"}";
+      return false;
+    }
+    next.v4l2_sources.clear();
+    for (const auto &x : j["v4l2Sources"]) {
+      if (!x.is_string()) { out_http_status=400; out_json="{\"error\":\"v4l2Sources entries must be strings\"}"; return false; }
+      std::string dev = x.get<std::string>();
+      if (!dev.empty()) next.v4l2_sources.push_back(dev);
+    }
+  }
+
   get_str("edidPath", s); next.edid_path = s;
   get_bool("modesetMatchInput", next.do_modeset);
   get_int("threads", next.threads);
   get_bool("bgr", next.input_is_bgr);
-
   get_str("present", s);
   if (!s.empty()) {
     if (!present_policy_valid(s)) { set_last_apply(false,"invalid present"); out_http_status=400; out_json="{\"error\":\"invalid present\"}"; return false; }
@@ -2283,16 +2540,13 @@ static bool apply_from_body(const std::string &body, std::string &out_json, int 
     for (const auto &jl : j["layers"]) {
       if (!jl.is_object()) continue;
       layer_cfg L;
-
       if (jl.contains("name") && jl["name"].is_string()) L.name = jl["name"].get<std::string>();
-
       std::string type = jl.value("type", "video");
       if (type=="crosshair") L.type = LAYER_CROSSHAIR;
       else if (type=="graphics") L.type = LAYER_GRAPHICS;
       else L.type = LAYER_VIDEO;
 
       L.enabled = jl.value("enabled", true);
-
       double op = jl.value("opacity", 1.0);
       if (!(op >= 0.0 && op <= 1.0)) { out_http_status=400; out_json="{\"error\":\"invalid layer opacity\"}"; return false; }
       L.opacity = (float)op;
@@ -2302,6 +2556,13 @@ static bool apply_from_body(const std::string &body, std::string &out_json, int 
       if (inv=="lower") L.invert_rel = INV_LOWER;
       else if (inv=="upper") L.invert_rel = INV_UPPER;
       else L.invert_rel = INV_NONE;
+
+      if (L.type == LAYER_VIDEO) {
+        if (jl.contains("videoSource")) {
+          if (!jl["videoSource"].is_string()) { out_http_status=400; out_json="{\"error\":\"videoSource must be string\"}"; return false; }
+          L.video_source = jl["videoSource"].get<std::string>();
+        }
+      }
 
       std::string srcRect = jl.value("srcRect", "");
       if (srcRect.empty()) { out_http_status=400; out_json="{\"error\":\"invalid layer srcRect\"}"; return false; }
@@ -2329,18 +2590,13 @@ static bool apply_from_body(const std::string &body, std::string &out_json, int 
         L.scale_x=(float)sx; L.scale_y=(float)sy;
       }
 
-      // filters (video only)
       if (L.type == LAYER_VIDEO && jl.contains("filters")) {
         if (!jl["filters"].is_array()) { out_http_status=400; out_json="{\"error\":\"filters must be array\"}"; return false; }
         for (const auto &jf : jl["filters"]) {
           if (!jf.is_object()) { out_http_status=400; out_json="{\"error\":\"invalid filter entry\"}"; return false; }
           std::string fid = jf.value("id", "");
           if (fid.empty()) { out_http_status=400; out_json="{\"error\":\"filter id required\"}"; return false; }
-          if (!jf.contains("params") || !jf["params"].is_object()) {
-            // allow missing params -> defaults
-          }
           json params = (jf.contains("params") && jf["params"].is_object()) ? jf["params"] : json::object();
-
           if (fid == "mono") {
             filter_cfg fc;
             fc.id = FILTER_MONO;
@@ -2351,29 +2607,21 @@ static bool apply_from_body(const std::string &body, std::string &out_json, int 
           } else if (fid == "sobel") {
             filter_cfg fc;
             fc.id = FILTER_SOBEL;
-
             std::string mode = params.value("mode", "edgesOnly");
             if (!(mode=="edgesOnly" || mode=="magnitude")) { out_http_status=400; out_json="{\"error\":\"sobel.mode invalid\"}"; return false; }
             fc.sobel_mode = (mode=="magnitude") ? filter_cfg::SOBEL_MAGNITUDE : filter_cfg::SOBEL_EDGES_ONLY;
-
             int th = params.value("threshold", 64);
             if (th < 0 || th > 255) { out_http_status=400; out_json="{\"error\":\"sobel.threshold 0..255\"}"; return false; }
             fc.sobel_threshold = (uint8_t)th;
-
             double a = params.value("alpha", 1.0);
             if (!(a>=0.0 && a<=1.0)) { out_http_status=400; out_json="{\"error\":\"sobel.alpha 0..1\"}"; return false; }
             fc.sobel_alpha = (float)a;
-
-            // IMPORTANT FIX:
-            // Do NOT touch params["invert"] before checking contains("invert"),
-            // because operator[] will create a null entry and make contains() true.
             if (params.contains("invert")) {
               if (!params["invert"].is_boolean()) { out_http_status=400; out_json="{\"error\":\"sobel.invert bool\"}"; return false; }
               fc.sobel_invert = params["invert"].get<bool>();
             } else {
               fc.sobel_invert = false;
             }
-
             L.filters.push_back(fc);
           } else {
             out_http_status=400;
@@ -2383,14 +2631,11 @@ static bool apply_from_body(const std::string &body, std::string &out_json, int 
         }
       }
 
-      // crosshair (unchanged validation)
       if (jl.contains("crosshair") && jl["crosshair"].is_object()) {
         const auto &xh = jl["crosshair"];
         L.xh.enabled = xh.value("enabled", false);
-
         std::string diam = xh.value("diam", "50x50");
         { uint32_t w=0,h=0; if (!parse_dim(diam.c_str(), &w,&h)) { out_http_status=400; out_json="{\"error\":\"invalid crosshair diam\"}"; return false; } L.xh.diam_w=w; L.xh.diam_h=h; }
-
         std::string center = xh.value("center", "");
         if (center.empty()) L.xh.center_set=false;
         else {
@@ -2398,22 +2643,17 @@ static bool apply_from_body(const std::string &body, std::string &out_json, int 
           if (!parse_point_csv(center.c_str(), &cx,&cy)) { out_http_status=400; out_json="{\"error\":\"invalid crosshair center\"}"; return false; }
           L.xh.center_set=true; L.xh.cx=cx; L.xh.cy=cy;
         }
-
         int th = xh.value("thickness", 1);
         if (th<1 || th>99) { out_http_status=400; out_json="{\"error\":\"invalid crosshair thickness\"}"; return false; }
         L.xh.thickness=(uint32_t)th;
-
         std::string mode = xh.value("mode", "solid");
         if (!(mode=="solid"||mode=="invert")) { out_http_status=400; out_json="{\"error\":\"invalid crosshair mode\"}"; return false; }
         L.xh.solid = (mode=="solid");
-
         std::string color = xh.value("color", "255,255,255");
         { uint8_t rr=0,gg=0,bb=0; if(!parse_rgb_csv(color.c_str(),&rr,&gg,&bb)){ out_http_status=400; out_json="{\"error\":\"invalid crosshair color\"}"; return false; } L.xh.r=rr; L.xh.g=gg; L.xh.b=bb; }
-
         double xop = xh.value("opacity", 1.0);
         if (!(xop>=0.0 && xop<=1.0)) { out_http_status=400; out_json="{\"error\":\"invalid crosshair opacity\"}"; return false; }
         L.xh.opacity=(float)xop;
-
         std::string xin = xh.value("invertRel", "none");
         if (!(xin=="none"||xin=="lower"||xin=="upper")) { out_http_status=400; out_json="{\"error\":\"invalid crosshair invertRel\"}"; return false; }
         if (xin=="lower") L.xh.invert_rel = INV_LOWER;
@@ -2425,8 +2665,11 @@ static bool apply_from_body(const std::string &body, std::string &out_json, int 
     }
   }
 
+  cfg_ensure_sources(next);
+
   bool need_reinit=false; std::string reason;
   if (next.v4l2_dev != cur.v4l2_dev) { need_reinit=true; reason="v4l2Dev changed"; }
+  else if (next.v4l2_sources != cur.v4l2_sources) { need_reinit=true; reason="v4l2Sources changed"; }
   else if (next.edid_path != cur.edid_path) { need_reinit=true; reason="edidPath changed"; }
   else if (next.do_modeset != cur.do_modeset) { need_reinit=true; reason="modesetMatchInput changed"; }
   else if (next.prefer_output_mode != cur.prefer_output_mode) { need_reinit=true; reason="preferOutputMode changed"; }
@@ -2458,20 +2701,14 @@ static bool apply_from_body(const std::string &body, std::string &out_json, int 
   return true;
 }
 
-static std::string config_json_provider() {
-  return config_to_json(cfg_snapshot());
-}
-
-static bool looks_like_dim(const std::string &s) {
-  uint32_t w=0,h=0;
-  return parse_dim(s.c_str(), &w, &h);
-}
+static std::string config_json_provider() { return config_to_json(cfg_snapshot()); }
+static bool looks_like_dim(const std::string &s) { uint32_t w=0,h=0; return parse_dim(s.c_str(), &w, &h); }
 
 // ---------------- Main ----------------
 static void usage(const char *argv0) {
   fprintf(stderr,
     "Usage: %s [--config PATH] [--no-webui] [--webui-port N] [--listen ADDR]\n"
-    "          --v4l2-dev /dev/video0 [--bgr] [--modeset=match-input]\n"
+    "          --v4l2-dev /dev/video0 [--v4l2-src /dev/video1 ...] [--bgr] [--modeset=match-input]\n"
     "          [--present=stretch|fit|1:1] [--edid PATH] [--threads N]\n"
     "          [--prefer-out=WxH|off]\n",
     argv0
@@ -2481,7 +2718,6 @@ static void usage(const char *argv0) {
 int main(int argc, char **argv) {
   g_pid.store(getpid());
   enableRawModeNonBlockingStdin();
-
   bool webui_enabled=true;
   int webui_port=8080;
 
@@ -2502,6 +2738,7 @@ int main(int argc, char **argv) {
     } else {
       fprintf(stderr, "[config] no config found; using defaults\n");
     }
+    cfg_ensure_sources(loaded);
     std::lock_guard<std::mutex> lk(g_cfg_mtx);
     g_cfg = loaded;
   }
@@ -2511,7 +2748,6 @@ int main(int argc, char **argv) {
     if (strcmp(argv[i],"--config")==0) { i++; continue; }
     if (strcmp(argv[i],"--no-webui")==0) { webui_enabled=false; continue; }
     if (strcmp(argv[i],"--webui-port")==0 && i+1<argc) { webui_port=atoi(argv[++i]); continue; }
-
     if (strcmp(argv[i],"--listen")==0 && i+1<argc) {
       std::lock_guard<std::mutex> lk(g_cfg_mtx);
       g_cfg.listen_addr=argv[++i];
@@ -2521,9 +2757,9 @@ int main(int argc, char **argv) {
       }
       continue;
     }
-
     std::lock_guard<std::mutex> lk(g_cfg_mtx);
     if (strcmp(argv[i],"--v4l2-dev")==0 && i+1<argc) g_cfg.v4l2_dev=argv[++i];
+    else if (strcmp(argv[i],"--v4l2-src")==0 && i+1<argc) g_cfg.v4l2_sources.push_back(argv[++i]);
     else if (strcmp(argv[i],"--modeset=match-input")==0) g_cfg.do_modeset=true;
     else if (strcmp(argv[i],"--bgr")==0) g_cfg.input_is_bgr=true;
     else if (strncmp(argv[i],"--present=",10)==0) {
@@ -2548,9 +2784,9 @@ int main(int argc, char **argv) {
     }
   }
 
-  // persist current config
   {
     std::lock_guard<std::mutex> lk(g_cfg_mtx);
+    cfg_ensure_sources(g_cfg);
     (void)save_config_locked();
   }
 
@@ -2565,19 +2801,15 @@ int main(int argc, char **argv) {
     usleep(1000*1000);
   }
 
-  // capture reference png
+  // capture reference png: use first active source
   std::vector<uint8_t> ref_png;
-  {
-    uint64_t start=monotonic_ms();
-    while (monotonic_ms()-start < 5000 && !g_quit.load()) {
-      if (p.detect_input_change_and_request_reinit()) break;
-      bool got=false;
-      (void)p.step_capture_publish_blocking(50, &got);
-      (void)got;
-    }
+  if (!p.sources.empty() && p.sources[0]) {
     std::vector<uint8_t> rgb;
-    if (grab_one_frame_rgb24(p.vfd, p.cbufs, p.cbuf_count, p.in_stride, p.in_w, p.in_h, rgb)) {
-      ref_png = rgb24_to_png_uncompressed(rgb.data(), p.in_w, p.in_h, p.in_w*3);
+    if (grab_one_frame_rgb24_from_source(*p.sources[0], rgb)) {
+      latest_frame lf = p.sources[0]->latest_snapshot();
+      uint32_t w = lf.valid ? lf.w : p.sources[0]->in_w;
+      uint32_t h = lf.valid ? lf.h : p.sources[0]->in_h;
+      ref_png = rgb24_to_png_uncompressed(rgb.data(), w, h, w*3);
       fprintf(stderr, "[webui] reference PNG captured: %zu bytes\n", ref_png.size());
     } else {
       fprintf(stderr, "[webui] reference PNG capture failed\n");
@@ -2592,16 +2824,12 @@ int main(int argc, char **argv) {
     webui_set_status_provider(&status_json);
     webui_set_quit_flag(&g_quit);
     webui_set_reference_png(ref_png);
-
     auto snap=cfg_snapshot();
     webui_set_listen_address(snap.listen_addr);
-
     fprintf(stderr, "[webui] starting server thread on %s:%d ...\n", snap.listen_addr.c_str(), webui_port);
-
     webui_set_filters_provider([]() -> std::string {
       return filter_registry_json().dump();
     });
-
     webui_start_detached(webui_port);
     fprintf(stderr, "[webui] open http://<device-ip>:%d/\n", webui_port);
   }

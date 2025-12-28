@@ -1,4 +1,5 @@
 {
+  "auxSources": [],
   "bgr": true,
   "edidPath": "/root/drm_overlay/720P60EDID.txt",
   "layers": [
@@ -10,85 +11,127 @@
         "enabled": false,
         "invertRel": "none",
         "mode": "solid",
-        "opacity": 1,
+        "opacity": 1.0,
+        "thickness": 1
+      },
+      "dstPos": "-7,178",
+      "enabled": true,
+      "filters": [
+        {
+          "id": "sobel",
+          "params": {
+            "alpha": 1.0,
+            "invert": false,
+            "mode": "edgesOnly",
+            "threshold": 1
+          }
+        },
+        {
+          "id": "denoise",
+          "params": {
+            "radius": 1,
+            "strength": 1.0
+          }
+        },
+        {
+          "id": "denoise",
+          "params": {
+            "radius": 1,
+            "strength": 1.0
+          }
+        },
+        {
+          "id": "denoise",
+          "params": {
+            "radius": 1,
+            "strength": 1.0
+          }
+        },
+        {
+          "id": "denoise",
+          "params": {
+            "radius": 1,
+            "strength": 1.0
+          }
+        },
+        {
+          "id": "sobel",
+          "params": {
+            "alpha": 1.0,
+            "invert": false,
+            "mode": "edgesOnly",
+            "threshold": 48
+          }
+        }
+      ],
+      "invertRel": "none",
+      "name": "Video 1",
+      "opacity": 1.0,
+      "scale": "0.5061,0.5006",
+      "srcRect": "0,0,1280,720",
+      "type": "video",
+      "videoSource": "/dev/video0"
+    },
+    {
+      "crosshair": {
+        "center": "",
+        "color": "255,255,255",
+        "diam": "50x50",
+        "enabled": false,
+        "invertRel": "none",
+        "mode": "solid",
+        "opacity": 1.0,
+        "thickness": 1
+      },
+      "dstPos": "639,178",
+      "enabled": true,
+      "filters": [],
+      "invertRel": "none",
+      "name": "Video 2",
+      "opacity": 1.0,
+      "scale": "0.5013,0.5005",
+      "srcRect": "0,0,1280,720",
+      "type": "video",
+      "videoSource": ""
+    },
+    {
+      "crosshair": {
+        "center": "",
+        "color": "255,255,255",
+        "diam": "50x50",
+        "enabled": false,
+        "invertRel": "none",
+        "mode": "solid",
+        "opacity": 1.0,
         "thickness": 1
       },
       "dstPos": "0,0",
       "enabled": true,
+      "filters": [],
       "invertRel": "none",
-      "name": "Video0_TL",
-      "opacity": 1,
+      "name": "Video 3",
+      "opacity": 0.5,
       "scale": "1,1",
-      "srcRect": "0,0,960,540",
-      "type": "video"
-    },
-    {
-      "crosshair": {
-        "center": "",
-        "color": "255,255,255",
-        "diam": "50x50",
-        "enabled": false,
-        "invertRel": "none",
-        "mode": "solid",
-        "opacity": 1,
-        "thickness": 1
-      },
-      "dstPos": "960,0",
-      "enabled": true,
-      "invertRel": "none",
-      "name": "Video0_TR",
-      "opacity": 1,
-      "scale": "1,1",
-      "srcRect": "960,0,960,540",
-      "type": "video"
-    },
-    {
-      "crosshair": {
-        "center": "",
-        "color": "255,255,255",
-        "diam": "50x50",
-        "enabled": false,
-        "invertRel": "none",
-        "mode": "solid",
-        "opacity": 1,
-        "thickness": 1
-      },
-      "dstPos": "0,540",
-      "enabled": true,
-      "invertRel": "none",
-      "name": "Video0_BL",
-      "opacity": 1,
-      "scale": "1,1",
-      "srcRect": "0,540,960,540",
-      "type": "video"
-    },
-    {
-      "crosshair": {
-        "center": "",
-        "color": "255,255,255",
-        "diam": "50x50",
-        "enabled": false,
-        "invertRel": "none",
-        "mode": "solid",
-        "opacity": 1,
-        "thickness": 1
-      },
-      "dstPos": "960,540",
-      "enabled": true,
-      "invertRel": "none",
-      "name": "Video0_BR",
-      "opacity": 1,
-      "scale": "1,1",
-      "srcRect": "960,540,960,540",
-      "type": "video"
+      "srcRect": "0,0,1280,512",
+      "type": "video",
+      "videoSource": "/dev/video2"
     }
   ],
-  "listenAddr": "0.0.0.0",
+  "listenAddr": "1280x720",
   "modesetMatchInput": false,
   "preferOutputMode": true,
   "preferOutputRes": "1280x720",
   "present": "fit",
+  "tc358743Order": [
+    "/dev/video0",
+    "/dev/video1"
+  ],
   "threads": 4,
   "v4l2Dev": "/dev/video1",
-  "viewport": "1920x1080"
+  "v4l2Sources": [
+    "/dev/video0",
+    "/dev/video1",
+    "/dev/video2"
+  ],
+  "viewport": "1280x720"
 }

@@ -1,94 +1,94 @@
 {
-  "v4l2Dev": "/dev/video0",
-  "edidPath": "/root/drm_overlay/720P60EDID.txt",
-  "modesetMatchInput": false,
-  "threads": 4,
   "bgr": true,
-  "present": "fit",
-  "preferOutputMode": true,
-  "preferOutputRes": "1280x720",
-  "viewport": "1920x1080",
-  "listenAddr": "0.0.0.0",
+  "edidPath": "/root/drm_overlay/720P60EDID.txt",
   "layers": [
     {
-      "name": "Video0_TL",
-      "type": "video",
-      "enabled": true,
-      "opacity": 0.5,
-      "invertRel": "none",
-      "srcRect": "0,0,960,540",
+      "crosshair": {
+        "center": "",
+        "color": "255,255,255",
+        "diam": "50x50",
+        "enabled": false,
+        "invertRel": "none",
+        "mode": "solid",
+        "opacity": 1,
+        "thickness": 1
+      },
       "dstPos": "0,0",
+      "enabled": true,
+      "invertRel": "none",
+      "name": "Video0_TL",
+      "opacity": 1,
       "scale": "1,1",
-      "crosshair": {
-        "enabled": false,
-        "diam": "50x50",
-        "center": "",
-        "thickness": 1,
-        "mode": "solid",
-        "color": "255,255,255",
-        "opacity": 1,
-        "invertRel": "none"
-      }
+      "srcRect": "0,0,960,540",
+      "type": "video"
     },
     {
-      "name": "Video0_TR",
-      "type": "video",
-      "enabled": true,
-      "opacity": 0.5,
-      "invertRel": "none",
-      "srcRect": "960,0,960,540",
+      "crosshair": {
+        "center": "",
+        "color": "255,255,255",
+        "diam": "50x50",
+        "enabled": false,
+        "invertRel": "none",
+        "mode": "solid",
+        "opacity": 1,
+        "thickness": 1
+      },
       "dstPos": "960,0",
+      "enabled": true,
+      "invertRel": "none",
+      "name": "Video0_TR",
+      "opacity": 1,
       "scale": "1,1",
-      "crosshair": {
-        "enabled": false,
-        "diam": "50x50",
-        "center": "",
-        "thickness": 1,
-        "mode": "solid",
-        "color": "255,255,255",
-        "opacity": 1,
-        "invertRel": "none"
-      }
+      "srcRect": "960,0,960,540",
+      "type": "video"
     },
     {
-      "name": "Video0_BL",
-      "type": "video",
-      "enabled": true,
-      "opacity": 0.5,
-      "invertRel": "none",
-      "srcRect": "0,540,960,540",
+      "crosshair": {
+        "center": "",
+        "color": "255,255,255",
+        "diam": "50x50",
+        "enabled": false,
+        "invertRel": "none",
+        "mode": "solid",
+        "opacity": 1,
+        "thickness": 1
+      },
       "dstPos": "0,540",
+      "enabled": true,
+      "invertRel": "none",
+      "name": "Video0_BL",
+      "opacity": 1,
       "scale": "1,1",
-      "crosshair": {
-        "enabled": false,
-        "diam": "50x50",
-        "center": "",
-        "thickness": 1,
-        "mode": "solid",
-        "color": "255,255,255",
-        "opacity": 1,
-        "invertRel": "none"
-      }
+      "srcRect": "0,540,960,540",
+      "type": "video"
     },
     {
-      "name": "Video0_BR",
-      "type": "video",
-      "enabled": true,
-      "opacity": 0.5,
-      "invertRel": "none",
-      "srcRect": "960,540,960,540",
-      "dstPos": "960,540",
-      "scale": "1,1",
       "crosshair": {
-        "enabled": false,
-        "diam": "50x50",
         "center": "",
-        "thickness": 1,
-        "mode": "solid",
         "color": "255,255,255",
+        "diam": "50x50",
+        "enabled": false,
+        "invertRel": "none",
+        "mode": "solid",
         "opacity": 1,
-        "invertRel": "none"
-      }
+        "thickness": 1
+      },
+      "dstPos": "960,540",
+      "enabled": true,
+      "invertRel": "none",
+      "name": "Video0_BR",
+      "opacity": 1,
+      "scale": "1,1",
+      "srcRect": "960,540,960,540",
+      "type": "video"
     }
-  ]
+  ],
+  "listenAddr": "0.0.0.0",
+  "modesetMatchInput": false,
+  "preferOutputMode": true,
+  "preferOutputRes": "1280x720",
+  "present": "fit",
+  "threads": 4,
+  "v4l2Dev": "/dev/video1",
+  "viewport": "1920x1080"
 }

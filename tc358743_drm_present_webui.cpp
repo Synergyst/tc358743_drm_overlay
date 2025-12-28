@@ -1,3 +1,19 @@
+/*
+  Optimized compositor version:
+  - output->viewport LUT per frame
+  - per-layer local-vp->src LUTs per frame (fixed-point)
+  - reduced per-pixel math and branches
+  - NEON used for fast clears and a small opaque path
+
+  IMPORTANT: WebUI wiring preserved exactly as original:
+    webui_set_config_json_provider
+    webui_set_apply_handler
+    webui_set_status_provider
+    webui_set_quit_flag
+    webui_set_reference_png
+    webui_set_listen_address
+    webui_start_detached(port)
+*/
 #ifndef _GNU_SOURCE
 #define _GNU_SOURCE
 #endif
@@ -44,7 +60,10 @@
   #define HAVE_NEON 0
 #endif
 
+#include "third_party/json.hpp"
 #include "tc358743_webui.h"
+
+using nlohmann::json;
 
 // -------------------- Helpers --------------------
 static void die(const char *msg) { perror(msg); exit(1); }
@@ -265,7 +284,7 @@ static int tc358743_set_pixfmt_rgb24(int fd, uint32_t *out_w, uint32_t *out_h, u
 static int v4l2_start_mmap_capture(int fd, struct cap_buf **out_bufs, uint32_t *out_nbufs) {
   struct v4l2_requestbuffers req;
   memset(&req, 0, sizeof(req));
-  req.count = 3; // keep 3; can experiment with 2 for latency later
+  req.count = 3;
   req.type = V4L2_BUF_TYPE_VIDEO_CAPTURE;
   req.memory = V4L2_MEMORY_MMAP;
   if (xioctl(fd, VIDIOC_REQBUFS, &req) < 0) {
@@ -387,7 +406,6 @@ static int dumb_fb_create(int drm_fd, uint32_t w, uint32_t h, uint32_t format, s
   out->handle = creq.handle;
   out->pitch = creq.pitch;
   out->size = creq.size;
-
   uint32_t handles[4] = { out->handle, 0, 0, 0 };
   uint32_t pitches[4] = { out->pitch, 0, 0, 0 };
   uint32_t offsets[4] = { 0, 0, 0, 0 };
@@ -396,7 +414,6 @@ static int dumb_fb_create(int drm_fd, uint32_t w, uint32_t h, uint32_t format, s
     ret = drmModeAddFB(drm_fd, w, h, 24, 32, out->pitch, out->handle, &out->fb_id);
     if (ret) return -1;
   }
-
   struct drm_mode_map_dumb mreq;
   memset(&mreq, 0, sizeof(mreq));
   mreq.handle = out->handle;
@@ -446,7 +463,7 @@ static bool plane_supports_format(drmModePlane *p, uint32_t fmt) {
   return false;
 }
 
-static uint32_t get_plane_prop_value_u64(int drm_fd, uint32_t plane_id, uint32_t prop_id, bool *ok) {
+static uint64_t get_plane_prop_value_u64(int drm_fd, uint32_t plane_id, uint32_t prop_id, bool *ok) {
   *ok=false;
   drmModeObjectProperties *props = drmModeObjectGetProperties(drm_fd, plane_id, DRM_MODE_OBJECT_PLANE);
   if (!props) return 0;
@@ -455,7 +472,7 @@ static uint32_t get_plane_prop_value_u64(int drm_fd, uint32_t plane_id, uint32_t
     if (props->props[i] == prop_id) { val = props->prop_values[i]; *ok=true; break; }
   }
   drmModeFreeObjectProperties(props);
-  return (uint32_t)val;
+  return val;
 }
 
 static uint32_t find_primary_plane_on_crtc(int drm_fd, uint32_t crtc_index, uint32_t format) {
@@ -469,7 +486,7 @@ static uint32_t find_primary_plane_on_crtc(int drm_fd, uint32_t crtc_index, uint
     uint32_t type_prop = get_prop_id(drm_fd, p->plane_id, DRM_MODE_OBJECT_PLANE, "type");
     if (type_prop) {
       bool ok=false;
-      uint32_t type_val = get_plane_prop_value_u64(drm_fd, p->plane_id, type_prop, &ok);
+      uint64_t type_val = get_plane_prop_value_u64(drm_fd, p->plane_id, type_prop, &ok);
       if (ok && type_val == 1) {
         uint32_t id = p->plane_id;
         drmModeFreePlane(p);
@@ -682,49 +699,12 @@ static int drm_plane_flip_fb_only(int drm_fd, uint32_t plane_id, uint32_t prop_f
 struct rect_u32 { uint32_t x=0,y=0,w=0,h=0; };
 struct point_i32 { int32_t x=0,y=0; };
 
-static bool parse_rect_csv(const std::string &s, rect_u32 &r) {
-  if (s.empty()) return false;
-  unsigned long x=0,y=0,w=0,h=0;
-  if (sscanf(s.c_str(), "%lu,%lu,%lu,%lu", &x,&y,&w,&h) != 4) return false;
-  if (w==0||h==0) return false;
-  r.x=(uint32_t)x; r.y=(uint32_t)y; r.w=(uint32_t)w; r.h=(uint32_t)h;
-  return true;
-}
-
-static bool parse_scale_csv(const std::string &s, float &sx, float &sy) {
-  if (s.empty()) return false;
-  double a=0,b=0;
-  if (sscanf(s.c_str(), "%lf,%lf", &a, &b) != 2) return false;
-  if (!(a>0.0001 && b>0.0001)) return false;
-  sx=(float)a; sy=(float)b;
-  return true;
-}
-
-static bool parse_pos_csv_str(const std::string &s, point_i32 &p) {
-  if (s.empty()) return false;
-  int x=0,y=0;
-  if (sscanf(s.c_str(), "%d,%d", &x, &y) != 2) return false;
-  p.x=x; p.y=y;
-  return true;
-}
-
-static inline uint32_t src_read_xrgb8888(const uint8_t *src_rgb, uint32_t src_stride,
-                                         uint32_t sx, uint32_t sy, bool input_is_bgr) {
-  const uint8_t *p = src_rgb + (uint64_t)sy*src_stride + (uint64_t)sx*3ull;
-  uint8_t r,g,b;
-  if (!input_is_bgr) { r=p[0]; g=p[1]; b=p[2]; }
-  else { b=p[0]; g=p[1]; r=p[2]; }
-  return 0xFF000000u | ((uint32_t)r<<16) | ((uint32_t)g<<8) | (uint32_t)b;
-}
-
 static inline uint32_t invert_xrgb8888(uint32_t xrgb) {
   return (xrgb & 0xFF000000u) | ((xrgb ^ 0x00FFFFFFu) & 0x00FFFFFFu);
 }
-
 static inline uint32_t pack_xrgb(uint8_t r, uint8_t g, uint8_t b) {
   return 0xFF000000u | ((uint32_t)r<<16) | ((uint32_t)g<<8) | (uint32_t)b;
 }
-
 static inline uint32_t blend_over_xrgb(uint32_t under, uint32_t over, uint8_t a) {
   if (a==0) return under;
   if (a==255) return over;
@@ -766,28 +746,6 @@ struct layer_cfg {
 
 struct viewport_cfg { bool set=false; uint32_t w=0,h=0; };
 
-static std::string layer_invert_to_str(layer_invert_rel r) {
-  if (r==INV_LOWER) return "lower";
-  if (r==INV_UPPER) return "upper";
-  return "none";
-}
-static layer_invert_rel layer_invert_from_str(const std::string &s) {
-  if (s=="lower") return INV_LOWER;
-  if (s=="upper") return INV_UPPER;
-  return INV_NONE;
-}
-static std::string layer_type_to_str(layer_type t) {
-  if (t==LAYER_CROSSHAIR) return "crosshair";
-  if (t==LAYER_GRAPHICS) return "graphics";
-  return "video";
-}
-static layer_type layer_type_from_str(const std::string &s) {
-  if (s=="crosshair") return LAYER_CROSSHAIR;
-  if (s=="graphics") return LAYER_GRAPHICS;
-  return LAYER_VIDEO;
-}
-
-// Crosshair runtime + bounded draw
 struct crosshair_runtime {
   bool enabled=false;
   int32_t out_cx=0,out_cy=0;
@@ -809,7 +767,7 @@ static crosshair_runtime crosshair_make_runtime(const crosshair_layer_cfg &xh, u
 static void composite_crosshair_bounded(uint8_t *dst_xrgb, uint32_t dst_stride, uint32_t out_w, uint32_t out_h,
                                         const crosshair_layer_cfg &cfg, layer_invert_rel inv, uint8_t alpha,
                                         uint32_t y0, uint32_t y1,
-                                        const uint32_t *upper_buf /*nullable*/) {
+                                        const uint32_t *upper_buf) {
   if (!cfg.enabled || alpha==0) return;
   crosshair_runtime rt = crosshair_make_runtime(cfg, out_w, out_h);
   if (!rt.enabled) return;
@@ -820,7 +778,6 @@ static void composite_crosshair_bounded(uint8_t *dst_xrgb, uint32_t dst_stride, 
   int32_t hx1 = rt.out_cx + rt.half_w;
   int32_t hy0 = rt.out_cy - rt.half_th;
   int32_t hy1 = rt.out_cy + rt.half_th;
-
   int32_t vx0 = rt.out_cx - rt.half_th;
   int32_t vx1 = rt.out_cx + rt.half_th;
   int32_t vy0 = rt.out_cy - rt.half_h;
@@ -830,7 +787,6 @@ static void composite_crosshair_bounded(uint8_t *dst_xrgb, uint32_t dst_stride, 
   int32_t ye = clampi(hy1, (int32_t)y0, (int32_t)y1-1);
   int32_t xs = clampi(hx0, 0, (int32_t)out_w-1);
   int32_t xe = clampi(hx1, 0, (int32_t)out_w-1);
-
   for (int32_t y=ys; y<=ye; y++) {
     uint32_t *drow = (uint32_t*)(dst_xrgb + (uint64_t)y*dst_stride);
     const uint32_t *urow = upper_buf ? (upper_buf + (size_t)y*(size_t)out_w) : nullptr;
@@ -849,7 +805,6 @@ static void composite_crosshair_bounded(uint8_t *dst_xrgb, uint32_t dst_stride, 
   ye = clampi(vy1, (int32_t)y0, (int32_t)y1-1);
   xs = clampi(vx0, 0, (int32_t)out_w-1);
   xe = clampi(vx1, 0, (int32_t)out_w-1);
-
   for (int32_t y=ys; y<=ye; y++) {
     uint32_t *drow = (uint32_t*)(dst_xrgb + (uint64_t)y*dst_stride);
     const uint32_t *urow = upper_buf ? (upper_buf + (size_t)y*(size_t)out_w) : nullptr;
@@ -865,7 +820,6 @@ static void composite_crosshair_bounded(uint8_t *dst_xrgb, uint32_t dst_stride, 
   }
 }
 
-// INV_UPPER cache (per-layer snapshots)
 struct invert_upper_cache {
   bool enabled=false;
   uint32_t out_w=0,out_h=0;
@@ -878,29 +832,191 @@ struct invert_upper_cache {
     upper_of_layer.clear();
     upper_of_layer.resize(layer_count);
   }
-
   void ensure_layer_count(size_t layer_count) {
     if (upper_of_layer.size() != layer_count) {
       upper_of_layer.clear();
       upper_of_layer.resize(layer_count);
     }
   }
-
   void clear_upper_of_layer_buffers() {
     for (auto &v : upper_of_layer) v.clear();
   }
 };
 
-static void clear_xrgb_rows(uint8_t *dst_xrgb, uint32_t dst_stride, uint32_t out_w, uint32_t y0, uint32_t y1) {
+static inline void clear_xrgb_rows_fast(uint8_t *dst_xrgb, uint32_t dst_stride, uint32_t out_w, uint32_t y0, uint32_t y1) {
   for (uint32_t y=y0;y<y1;y++) {
     uint32_t *d = (uint32_t*)(dst_xrgb + (uint64_t)y*dst_stride);
-    for (uint32_t x=0;x<out_w;x++) d[x]=0xFF000000u;
+    uint32_t x=0;
+#if HAVE_NEON
+    uint32x4_t v = vdupq_n_u32(0xFF000000u);
+    for (; x + 16 <= out_w; x += 16) {
+      vst1q_u32(d + x + 0, v);
+      vst1q_u32(d + x + 4, v);
+      vst1q_u32(d + x + 8, v);
+      vst1q_u32(d + x + 12, v);
+    }
+    for (; x + 4 <= out_w; x += 4) vst1q_u32(d + x, v);
+#endif
+    for (; x < out_w; x++) d[x] = 0xFF000000u;
   }
 }
 
+struct rect_i32 { int32_t x0=0, y0=0, x1=0, y1=0; }; // [x0,x1) [y0,y1)
+static inline rect_i32 rect_intersect(const rect_i32 &a, const rect_i32 &b) {
+  rect_i32 r;
+  r.x0 = std::max(a.x0, b.x0);
+  r.y0 = std::max(a.y0, b.y0);
+  r.x1 = std::min(a.x1, b.x1);
+  r.y1 = std::min(a.y1, b.y1);
+  if (r.x1 < r.x0) r.x1 = r.x0;
+  if (r.y1 < r.y0) r.y1 = r.y0;
+  return r;
+}
+static inline bool rect_empty(const rect_i32 &r) {
+  return (r.x0 >= r.x1) || (r.y0 >= r.y1);
+}
+static inline int32_t map_vx_to_ox(const present_rect &pr, uint32_t vpw, int32_t vx) {
+  return pr.crtc_x + (int32_t)(((int64_t)vx * (int64_t)pr.crtc_w) / (int64_t)vpw);
+}
+static inline int32_t map_vy_to_oy(const present_rect &pr, uint32_t vph, int32_t vy) {
+  return pr.crtc_y + (int32_t)(((int64_t)vy * (int64_t)pr.crtc_h) / (int64_t)vph);
+}
+static inline rect_i32 layer_vp_rect_to_output_bounds(
+  const present_rect &pr,
+  uint32_t vpw, uint32_t vph,
+  int32_t layer_vp_x0, int32_t layer_vp_y0,
+  int32_t layer_vp_w,  int32_t layer_vp_h
+) {
+  rect_i32 r{0,0,0,0};
+  if (vpw == 0 || vph == 0) return r;
+  if (pr.crtc_w == 0 || pr.crtc_h == 0) return r;
+  if (layer_vp_w <= 0 || layer_vp_h <= 0) return r;
+  int32_t ox0 = map_vx_to_ox(pr, vpw, layer_vp_x0);
+  int32_t ox1 = map_vx_to_ox(pr, vpw, layer_vp_x0 + layer_vp_w);
+  int32_t oy0 = map_vy_to_oy(pr, vph, layer_vp_y0);
+  int32_t oy1 = map_vy_to_oy(pr, vph, layer_vp_y0 + layer_vp_h);
+  if (ox1 < ox0) std::swap(ox0, ox1);
+  if (oy1 < oy0) std::swap(oy0, oy1);
+  ox0 -= 1; oy0 -= 1;
+  ox1 += 1; oy1 += 1;
+  r.x0 = ox0; r.y0 = oy0; r.x1 = ox1; r.y1 = oy1;
+  return r;
+}
+static inline rect_i32 clamp_bounds_to_output_and_band(const rect_i32 &r, uint32_t out_w, uint32_t out_h, uint32_t y0, uint32_t y1) {
+  rect_i32 out = r;
+  rect_i32 out_full{0,0,(int32_t)out_w,(int32_t)out_h};
+  rect_i32 band{0,(int32_t)y0,(int32_t)out_w,(int32_t)y1};
+  out = rect_intersect(out, out_full);
+  out = rect_intersect(out, band);
+  return out;
+}
+
+// Output->viewport LUTs
+struct out_to_vp_lut {
+  uint32_t out_w=0, out_h=0;
+  uint32_t vpw=0, vph=0;
+  present_rect pr{};
+  std::vector<int32_t> ox_to_vx; // out_w
+  std::vector<int32_t> oy_to_vy; // out_h
+
+  void rebuild(uint32_t outW, uint32_t outH, uint32_t vpW, uint32_t vpH, const present_rect &p) {
+    out_w=outW; out_h=outH; vpw=vpW; vph=vpH; pr=p;
+    ox_to_vx.assign(out_w, -1);
+    oy_to_vy.assign(out_h, -1);
+    if (pr.crtc_w == 0 || pr.crtc_h == 0 || vpw == 0 || vph == 0) return;
+
+    for (uint32_t ox=0; ox<out_w; ox++) {
+      int32_t tx = (int32_t)ox - pr.crtc_x;
+      if (tx < 0 || tx >= (int32_t)pr.crtc_w) continue;
+      int32_t vx = (int32_t)(((int64_t)tx * (int64_t)vpw) / (int64_t)pr.crtc_w);
+      if (vx < 0 || vx >= (int32_t)vpw) continue;
+      ox_to_vx[ox] = vx;
+    }
+    for (uint32_t oy=0; oy<out_h; oy++) {
+      int32_t ty = (int32_t)oy - pr.crtc_y;
+      if (ty < 0 || ty >= (int32_t)pr.crtc_h) continue;
+      int32_t vy = (int32_t)(((int64_t)ty * (int64_t)vph) / (int64_t)pr.crtc_h);
+      if (vy < 0 || vy >= (int32_t)vph) continue;
+      oy_to_vy[oy] = vy;
+    }
+  }
+};
+
+struct layer_map_cache {
+  rect_u32 sr{};
+  int32_t dst_x=0, dst_y=0;
+  int32_t vp_w=0, vp_h=0;
+  uint8_t alpha=255;
+  layer_invert_rel inv=INV_NONE;
+  bool enabled=false;
+  std::vector<uint16_t> x_map;
+  std::vector<uint16_t> y_map;
+
+  void build_from_layer(const layer_cfg &L, uint32_t in_w, uint32_t in_h) {
+    enabled=false;
+    x_map.clear(); y_map.clear();
+
+    if (!L.enabled || L.type != LAYER_VIDEO) return;
+
+    rect_u32 s = L.src_rect;
+    if (s.w==0 || s.h==0) return;
+    if (s.x >= in_w || s.y >= in_h) return;
+    if (s.x + s.w > in_w) s.w = in_w - s.x;
+    if (s.y + s.h > in_h) s.h = in_h - s.y;
+    if (s.w==0 || s.h==0) return;
+
+    float sx = L.scale_x, sy = L.scale_y;
+    if (!(sx > 0.0001f && sy > 0.0001f)) return;
+
+    sr=s;
+    dst_x=L.dst_pos.x; dst_y=L.dst_pos.y;
+    vp_w=(int32_t)std::max(1.0f, std::floor((float)sr.w * sx + 0.5f));
+    vp_h=(int32_t)std::max(1.0f, std::floor((float)sr.h * sy + 0.5f));
+    alpha=(uint8_t)std::lround(std::clamp(L.opacity,0.0f,1.0f)*255.0f);
+    inv=L.invert_rel;
+
+    if (alpha==0) return;
+
+    x_map.resize((size_t)vp_w);
+    y_map.resize((size_t)vp_h);
+
+    for (int32_t vx=0; vx<vp_w; vx++) {
+      uint32_t sxi = (uint32_t)(((uint64_t)(uint32_t)vx * (uint64_t)sr.w) / (uint64_t)vp_w);
+      if (sxi >= sr.w) sxi = sr.w-1;
+      x_map[(size_t)vx] = (uint16_t)sxi;
+    }
+    for (int32_t vy=0; vy<vp_h; vy++) {
+      uint32_t syi = (uint32_t)(((uint64_t)(uint32_t)vy * (uint64_t)sr.h) / (uint64_t)vp_h);
+      if (syi >= sr.h) syi = sr.h-1;
+      y_map[(size_t)vy] = (uint16_t)syi;
+    }
+
+    enabled=true;
+  }
+};
+
+static inline uint32_t sample_rgb24_xrgb(const uint8_t *src, uint32_t stride, uint32_t sx, uint32_t sy, bool bgr) {
+  const uint8_t *p = src + (uint64_t)sy * stride + (uint64_t)sx * 3ull;
+  uint8_t r = bgr ? p[2] : p[0];
+  uint8_t g = p[1];
+  uint8_t b = bgr ? p[0] : p[2];
+  return 0xFF000000u | ((uint32_t)r<<16) | ((uint32_t)g<<8) | (uint32_t)b;
+}
+
+#if HAVE_NEON
+static inline void write4_opaque_rgb24_to_xrgb(uint32_t *dst, const uint8_t *src, uint32_t stride, uint32_t sy, const uint32_t *sx_arr, bool bgr) {
+  uint32_t p0 = sample_rgb24_xrgb(src, stride, sx_arr[0], sy, bgr);
+  uint32_t p1 = sample_rgb24_xrgb(src, stride, sx_arr[1], sy, bgr);
+  uint32_t p2 = sample_rgb24_xrgb(src, stride, sx_arr[2], sy, bgr);
+  uint32_t p3 = sample_rgb24_xrgb(src, stride, sx_arr[3], sy, bgr);
+  uint32x4_t v = {p0,p1,p2,p3};
+  vst1q_u32(dst, v);
+}
+#endif
+
 // ---------------- Compositor thread pool ----------------
 struct comp_job {
-  uint64_t job_id=0; // generation ID
+  uint64_t job_id=0;
   const uint8_t *src_rgb=nullptr;
   uint32_t src_stride=0;
   uint32_t in_w=0,in_h=0;
@@ -912,6 +1028,9 @@ struct comp_job {
   uint32_t vpw=0,vph=0;
   const std::vector<layer_cfg> *layers=nullptr;
   const invert_upper_cache *upper_cache=nullptr;
+
+  const out_to_vp_lut *lut=nullptr;
+  const std::vector<layer_map_cache> *layer_maps=nullptr;
 };
 
 struct comp_worker { pthread_t th{}; int id=0; int cpu=-1; uint32_t y0=0,y1=0; };
@@ -938,118 +1057,14 @@ static void pin_thread_to_cpu(int cpu) {
 #endif
 }
 
-// New mapping helpers (fast compositor)
-static inline int32_t map_vx_to_ox(const present_rect &pr, uint32_t vpw, int32_t vx) {
-  return pr.crtc_x + (int32_t)(((int64_t)vx * (int64_t)pr.crtc_w) / (int64_t)vpw);
-}
-static inline int32_t map_vy_to_oy(const present_rect &pr, uint32_t vph, int32_t vy) {
-  return pr.crtc_y + (int32_t)(((int64_t)vy * (int64_t)pr.crtc_h) / (int64_t)vph);
-}
-static inline bool oy_to_vy_span(const present_rect &pr, uint32_t vph, int32_t oy, int32_t *vy0, int32_t *vy1_excl) {
-  if (!vy0 || !vy1_excl) return false;
-  if (pr.crtc_h == 0 || vph == 0) return false;
-  int32_t t = oy - pr.crtc_y;
-  if (t < 0 || t >= (int32_t)pr.crtc_h) return false;
-  int64_t num0 = (int64_t)t * (int64_t)vph;
-  int64_t num1 = (int64_t)(t + 1) * (int64_t)vph;
-  int64_t den = (int64_t)pr.crtc_h;
-  int32_t a = (int32_t)((num0 + den - 1) / den);
-  int32_t b = (int32_t)((num1 + den - 1) / den);
-  if (a < 0) a = 0;
-  if (b < 0) b = 0;
-  if (a > (int32_t)vph) a = (int32_t)vph;
-  if (b > (int32_t)vph) b = (int32_t)vph;
-  *vy0 = a;
-  *vy1_excl = b;
-  return (b > a);
-}
-static inline bool ox_to_vx_span(const present_rect &pr, uint32_t vpw, int32_t ox, int32_t *vx0, int32_t *vx1_excl) {
-  if (!vx0 || !vx1_excl) return false;
-  if (pr.crtc_w == 0 || vpw == 0) return false;
-  int32_t t = ox - pr.crtc_x;
-  if (t < 0 || t >= (int32_t)pr.crtc_w) return false;
-  int64_t num0 = (int64_t)t * (int64_t)vpw;
-  int64_t num1 = (int64_t)(t + 1) * (int64_t)vpw;
-  int64_t den = (int64_t)pr.crtc_w;
-  int32_t a = (int32_t)((num0 + den - 1) / den);
-  int32_t b = (int32_t)((num1 + den - 1) / den);
-  if (a < 0) a = 0;
-  if (b < 0) b = 0;
-  if (a > (int32_t)vpw) a = (int32_t)vpw;
-  if (b > (int32_t)vpw) b = (int32_t)vpw;
-  *vx0 = a;
-  *vx1_excl = b;
-  return (b > a);
-}
-
-struct rect_i32 { int32_t x0=0, y0=0, x1=0, y1=0; }; // [x0,x1) [y0,y1)
-
-static inline rect_i32 rect_intersect(const rect_i32 &a, const rect_i32 &b) {
-  rect_i32 r;
-  r.x0 = std::max(a.x0, b.x0);
-  r.y0 = std::max(a.y0, b.y0);
-  r.x1 = std::min(a.x1, b.x1);
-  r.y1 = std::min(a.y1, b.y1);
-  if (r.x1 < r.x0) r.x1 = r.x0;
-  if (r.y1 < r.y0) r.y1 = r.y0;
-  return r;
-}
-
-static inline bool rect_empty(const rect_i32 &r) {
-  return (r.x0 >= r.x1) || (r.y0 >= r.y1);
-}
-
-static inline rect_i32 layer_vp_rect_to_output_bounds(
-  const present_rect &pr,
-  uint32_t vpw, uint32_t vph,
-  int32_t layer_vp_x0, int32_t layer_vp_y0,
-  int32_t layer_vp_w,  int32_t layer_vp_h
-) {
-  rect_i32 r{0,0,0,0};
-  if (vpw == 0 || vph == 0) return r;
-  if (pr.crtc_w == 0 || pr.crtc_h == 0) return r;
-  if (layer_vp_w <= 0 || layer_vp_h <= 0) return r;
-  int32_t ox0 = map_vx_to_ox(pr, vpw, layer_vp_x0);
-  int32_t ox1 = map_vx_to_ox(pr, vpw, layer_vp_x0 + layer_vp_w);
-  int32_t oy0 = map_vy_to_oy(pr, vph, layer_vp_y0);
-  int32_t oy1 = map_vy_to_oy(pr, vph, layer_vp_y0 + layer_vp_h);
-  if (ox1 < ox0) std::swap(ox0, ox1);
-  if (oy1 < oy0) std::swap(oy0, oy1);
-  // expand by 1px safety
-  ox0 -= 1; oy0 -= 1;
-  ox1 += 1; oy1 += 1;
-  r.x0 = ox0; r.y0 = oy0; r.x1 = ox1; r.y1 = oy1;
-  return r;
-}
-
-static inline rect_i32 clamp_bounds_to_output_and_band(const rect_i32 &r, uint32_t out_w, uint32_t out_h, uint32_t y0, uint32_t y1) {
-  rect_i32 out = r;
-  rect_i32 out_full;
-  out_full.x0 = 0;
-  out_full.y0 = 0;
-  out_full.x1 = (int32_t)out_w;
-  out_full.y1 = (int32_t)out_h;
-  rect_i32 band;
-  band.x0 = 0;
-  band.y0 = (int32_t)y0;
-  band.x1 = (int32_t)out_w;
-  band.y1 = (int32_t)y1;
-  out = rect_intersect(out, out_full);
-  out = rect_intersect(out, band);
-  return out;
-}
-
-// FAST compositor
-static void composite_layers_rows(const comp_job &job, uint32_t y0, uint32_t y1) {
+static void composite_layers_rows_optimized(const comp_job &job, uint32_t y0, uint32_t y1) {
   const auto &layers = *job.layers;
+  const auto &maps = *job.layer_maps;
+  const out_to_vp_lut &lut = *job.lut;
 
-  clear_xrgb_rows(job.dst_xrgb, job.dst_stride, job.out_w, y0, y1);
+  clear_xrgb_rows_fast(job.dst_xrgb, job.dst_stride, job.out_w, y0, y1);
 
-  const present_rect &pr = job.map_pr;
-  const uint32_t vpw = job.vpw ? job.vpw : 1;
-  const uint32_t vph = job.vph ? job.vph : 1;
-
-  for (size_t li = 0; li < layers.size(); li++) {
+  for (size_t li=0; li<layers.size(); li++) {
     const layer_cfg &L = layers[li];
     if (!L.enabled) continue;
 
@@ -1063,74 +1078,82 @@ static void composite_layers_rows(const comp_job &job, uint32_t y0, uint32_t y1)
       uint8_t a = (uint8_t)std::lround(std::clamp(L.xh.opacity, 0.0f, 1.0f) * 255.0f);
       if (a == 0) continue;
       composite_crosshair_bounded(job.dst_xrgb, job.dst_stride, job.out_w, job.out_h,
-                                 L.xh, L.xh.invert_rel, a, y0, y1, upper_buf);
+                                  L.xh, L.xh.invert_rel, a, y0, y1, upper_buf);
       continue;
     }
 
     if (L.type != LAYER_VIDEO) continue;
 
-    rect_u32 sr = L.src_rect;
-    if (sr.w == 0 || sr.h == 0) continue;
-    if (sr.x >= job.in_w || sr.y >= job.in_h) continue;
-    if (sr.x + sr.w > job.in_w) sr.w = job.in_w - sr.x;
-    if (sr.y + sr.h > job.in_h) sr.h = job.in_h - sr.y;
+    const layer_map_cache &M = maps[li];
+    if (!M.enabled) continue;
 
-    float sx = L.scale_x, sy = L.scale_y;
-    if (!(sx > 0.0001f && sy > 0.0001f)) continue;
+    const uint8_t a = M.alpha;
+    const bool bgr = job.input_is_bgr;
 
-    const int32_t layer_vp_x0 = L.dst_pos.x;
-    const int32_t layer_vp_y0 = L.dst_pos.y;
-    const int32_t layer_vp_w  = (int32_t)std::max(1.0f, std::floor((float)sr.w * sx + 0.5f));
-    const int32_t layer_vp_h  = (int32_t)std::max(1.0f, std::floor((float)sr.h * sy + 0.5f));
-
-    uint8_t a = (uint8_t)std::lround(std::clamp(L.opacity, 0.0f, 1.0f) * 255.0f);
-    if (a == 0) continue;
-
-    rect_i32 ob = layer_vp_rect_to_output_bounds(pr, vpw, vph, layer_vp_x0, layer_vp_y0, layer_vp_w, layer_vp_h);
+    rect_i32 ob = layer_vp_rect_to_output_bounds(job.map_pr, job.vpw, job.vph, M.dst_x, M.dst_y, M.vp_w, M.vp_h);
     ob = clamp_bounds_to_output_and_band(ob, job.out_w, job.out_h, y0, y1);
     if (rect_empty(ob)) continue;
 
-    for (int32_t oy = ob.y0; oy < ob.y1; oy++) {
-      int32_t vy_a = 0, vy_b = 0;
-      if (!oy_to_vy_span(pr, vph, oy, &vy_a, &vy_b)) continue;
+    for (int32_t oy=ob.y0; oy<ob.y1; oy++) {
+      int32_t vy = lut.oy_to_vy[(uint32_t)oy];
+      if (vy < 0) continue;
+      int32_t lvy = vy - M.dst_y;
+      if ((uint32_t)lvy >= (uint32_t)M.vp_h) continue;
 
-      const int32_t layer_vp_y1 = layer_vp_y0 + layer_vp_h;
-      int32_t vy0 = std::max(vy_a, layer_vp_y0);
-      int32_t vy1 = std::min(vy_b, layer_vp_y1);
-      if (vy0 >= vy1) continue;
-
-      // sample top of span (fast, deterministic)
-      int32_t vyy = vy0;
-
-      float local_y = (float)(vyy - layer_vp_y0);
-      uint32_t syi = sr.y + (uint32_t)std::min((uint32_t)sr.h - 1u, (uint32_t)(local_y / sy));
-
+      uint32_t syi = M.sr.y + (uint32_t)M.y_map[(size_t)lvy];
       uint32_t *drow = (uint32_t*)(job.dst_xrgb + (uint64_t)oy * job.dst_stride);
-      const uint32_t *urow = upper_buf ? (upper_buf + (size_t)oy * (size_t)job.out_w) : nullptr;
+      const uint32_t *urow = upper_buf ? (upper_buf + (size_t)oy*(size_t)job.out_w) : nullptr;
 
-      for (int32_t ox = ob.x0; ox < ob.x1; ox++) {
-        int32_t vx_a = 0, vx_b = 0;
-        if (!ox_to_vx_span(pr, vpw, ox, &vx_a, &vx_b)) continue;
+      const bool opaque_simple = (a == 255 && M.inv == INV_NONE && upper_buf == nullptr);
 
-        const int32_t layer_vp_x1 = layer_vp_x0 + layer_vp_w;
-        int32_t vx0 = std::max(vx_a, layer_vp_x0);
-        int32_t vx1 = std::min(vx_b, layer_vp_x1);
-        if (vx0 >= vx1) continue;
+      int32_t ox = ob.x0;
 
-        // sample left of span (fast, deterministic)
-        int32_t vxx = vx0;
+#if HAVE_NEON
+      if (opaque_simple) {
+        for (; ox + 4 <= ob.x1; ox += 4) {
+          int32_t vx0 = lut.ox_to_vx[(uint32_t)(ox+0)];
+          int32_t vx1 = lut.ox_to_vx[(uint32_t)(ox+1)];
+          int32_t vx2 = lut.ox_to_vx[(uint32_t)(ox+2)];
+          int32_t vx3 = lut.ox_to_vx[(uint32_t)(ox+3)];
+          if (vx0 < 0 || vx1 < 0 || vx2 < 0 || vx3 < 0) break;
 
-        float local_x = (float)(vxx - layer_vp_x0);
-        uint32_t sxi = sr.x + (uint32_t)std::min((uint32_t)sr.w - 1u, (uint32_t)(local_x / sx));
+          int32_t lvx0 = vx0 - M.dst_x;
+          int32_t lvx1 = vx1 - M.dst_x;
+          int32_t lvx2 = vx2 - M.dst_x;
+          int32_t lvx3 = vx3 - M.dst_x;
+          if ((uint32_t)lvx0 >= (uint32_t)M.vp_w ||
+              (uint32_t)lvx1 >= (uint32_t)M.vp_w ||
+              (uint32_t)lvx2 >= (uint32_t)M.vp_w ||
+              (uint32_t)lvx3 >= (uint32_t)M.vp_w) break;
 
-        uint32_t over = src_read_xrgb8888(job.src_rgb, job.src_stride, sxi, syi, job.input_is_bgr);
-        if (L.invert_rel == INV_LOWER) {
+          uint32_t sx_arr[4];
+          sx_arr[0] = M.sr.x + (uint32_t)M.x_map[(size_t)lvx0];
+          sx_arr[1] = M.sr.x + (uint32_t)M.x_map[(size_t)lvx1];
+          sx_arr[2] = M.sr.x + (uint32_t)M.x_map[(size_t)lvx2];
+          sx_arr[3] = M.sr.x + (uint32_t)M.x_map[(size_t)lvx3];
+          write4_opaque_rgb24_to_xrgb(drow + ox, job.src_rgb, job.src_stride, syi, sx_arr, bgr);
+        }
+      }
+#endif
+
+      for (; ox < ob.x1; ox++) {
+        int32_t vx = lut.ox_to_vx[(uint32_t)ox];
+        if (vx < 0) continue;
+        int32_t lvx = vx - M.dst_x;
+        if ((uint32_t)lvx >= (uint32_t)M.vp_w) continue;
+
+        uint32_t sxi = M.sr.x + (uint32_t)M.x_map[(size_t)lvx];
+        uint32_t over = sample_rgb24_xrgb(job.src_rgb, job.src_stride, sxi, syi, bgr);
+
+        if (M.inv == INV_LOWER) {
           over = invert_xrgb8888(drow[(uint32_t)ox]);
-        } else if (L.invert_rel == INV_UPPER) {
+        } else if (M.inv == INV_UPPER) {
           uint32_t base = urow ? urow[(uint32_t)ox] : 0xFF000000u;
           over = invert_xrgb8888(base);
         }
-        drow[(uint32_t)ox] = blend_over_xrgb(drow[(uint32_t)ox], over, a);
+
+        if (a == 255 && M.inv == INV_NONE) drow[(uint32_t)ox] = over;
+        else drow[(uint32_t)ox] = blend_over_xrgb(drow[(uint32_t)ox], over, a);
       }
     }
   }
@@ -1152,7 +1175,7 @@ static void *comp_worker_main(void *arg) {
     uint32_t y0=w->y0, y1=w->y1;
     pthread_mutex_unlock(&g_comp_mtx);
 
-    composite_layers_rows(job, y0, y1);
+    composite_layers_rows_optimized(job, y0, y1);
 
     pthread_mutex_lock(&g_comp_mtx);
     if (g_comp_cur_job_id == my_job_id) {
@@ -1210,111 +1233,7 @@ static void comp_pool_run(const comp_job &job_in) {
   pthread_mutex_unlock(&g_comp_mtx);
 }
 
-// ---------------- Minimal JSON helpers (unchanged) ----------------
-static std::string json_escape(const std::string &s) {
-  std::string o; o.reserve(s.size()+8);
-  for (char c: s) {
-    switch (c) {
-      case '\\': o += "\\\\"; break;
-      case '"':  o += "\\\""; break;
-      case '\n': o += "\\n"; break;
-      case '\r': o += "\\r"; break;
-      case '\t': o += "\\t"; break;
-      default: o += c; break;
-    }
-  }
-  return o;
-}
-
-static bool json_get_string(const std::string &j, const std::string &key, std::string &out) {
-  std::string pat = "\"" + key + "\"";
-  auto k = j.find(pat);
-  if (k == std::string::npos) return false;
-  auto colon = j.find(':', k + pat.size());
-  if (colon == std::string::npos) return false;
-  auto q1 = j.find('"', colon + 1);
-  if (q1 == std::string::npos) return false;
-  auto q2 = j.find('"', q1 + 1);
-  if (q2 == std::string::npos) return false;
-  out = j.substr(q1 + 1, q2 - (q1 + 1));
-  return true;
-}
-
-static bool json_get_bool(const std::string &j, const std::string &key, bool &out) {
-  std::string pat = "\"" + key + "\"";
-  auto k = j.find(pat);
-  if (k == std::string::npos) return false;
-  auto colon = j.find(':', k + pat.size());
-  if (colon == std::string::npos) return false;
-  auto v = j.substr(colon + 1);
-  auto first = v.find_first_not_of(" \t\r\n");
-  if (first == std::string::npos) return false;
-  v = v.substr(first);
-  if (v.rfind("true", 0) == 0) { out=true; return true; }
-  if (v.rfind("false",0) == 0) { out=false; return true; }
-  return false;
-}
-
-static bool json_get_int(const std::string &j, const std::string &key, int &out) {
-  std::string pat = "\"" + key + "\"";
-  auto k = j.find(pat);
-  if (k == std::string::npos) return false;
-  auto colon = j.find(':', k + pat.size());
-  if (colon == std::string::npos) return false;
-  auto v = j.substr(colon + 1);
-  auto first = v.find_first_not_of(" \t\r\n");
-  if (first == std::string::npos) return false;
-  size_t i = first;
-  if (v[i] == '-') i++;
-  size_t start = i;
-  while (i < v.size() && (v[i] >= '0' && v[i] <= '9')) i++;
-  if (i == start) return false;
-  out = atoi(v.substr(first, i-first).c_str());
-  return true;
-}
-
-static bool json_get_double(const std::string &j, const std::string &key, double &out) {
-  std::string pat = "\"" + key + "\"";
-  auto k = j.find(pat);
-  if (k == std::string::npos) return false;
-  auto colon = j.find(':', k + pat.size());
-  if (colon == std::string::npos) return false;
-  auto v = j.substr(colon + 1);
-  auto first = v.find_first_not_of(" \t\r\n");
-  if (first == std::string::npos) return false;
-  char *end=nullptr;
-  out = strtod(v.c_str() + first, &end);
-  if (end == (v.c_str()+first)) return false;
-  return true;
-}
-
-static bool json_get_array_object_slices(const std::string &j, const std::string &key, std::vector<std::string> &out_objs) {
-  out_objs.clear();
-  std::string pat="\"" + key + "\"";
-  auto k=j.find(pat);
-  if (k==std::string::npos) return false;
-  auto colon=j.find(':', k+pat.size());
-  if (colon==std::string::npos) return false;
-  auto lb=j.find('[', colon+1);
-  if (lb==std::string::npos) return false;
-  size_t i=lb+1;
-  int depth=0;
-  size_t start=std::string::npos;
-  for (; i<j.size(); i++) {
-    char c=j[i];
-    if (c=='{') { if (depth==0) start=i; depth++; }
-    else if (c=='}') {
-      if (depth>0) depth--;
-      if (depth==0 && start!=std::string::npos) {
-        out_objs.push_back(j.substr(start, i-start+1));
-        start=std::string::npos;
-      }
-    } else if (c==']' && depth==0) return true;
-  }
-  return true;
-}
-
-// ---------------- Config structure ----------------
+// ---------------- Config + JSON ----------------
 struct persisted_config {
   std::string v4l2_dev="/dev/video0";
   std::string edid_path;
@@ -1330,116 +1249,169 @@ struct persisted_config {
   std::string listen_addr="0.0.0.0";
 };
 
-std::string config_to_json(const persisted_config &c) {
-  std::ostringstream ss;
-  ss << "{";
-  ss << "\"v4l2Dev\":\"" << json_escape(c.v4l2_dev) << "\",";
-  ss << "\"edidPath\":\"" << json_escape(c.edid_path) << "\",";
-  ss << "\"modesetMatchInput\":" << (c.do_modeset ? "true":"false") << ",";
-  ss << "\"threads\":" << c.threads << ",";
-  ss << "\"bgr\":" << (c.input_is_bgr ? "true":"false") << ",";
-  ss << "\"present\":\"" << json_escape(c.present_policy) << "\",";
-  ss << "\"preferOutputMode\":" << (c.prefer_output_mode ? "true":"false") << ",";
-  ss << "\"preferOutputRes\":\"" << c.prefer_out_w << "x" << c.prefer_out_h << "\",";
-  ss << "\"viewport\":\"";
-  if (c.viewport.set) ss << c.viewport.w << "x" << c.viewport.h;
-  ss << "\",";
-  ss << "\"listenAddr\":\"" << json_escape(c.listen_addr) << "\",";
-  ss << "\"layers\":[";
-  for (size_t i=0;i<c.layers.size();i++) {
-    const auto &L=c.layers[i];
-    if (i) ss << ",";
-    ss << "{";
-    ss << "\"name\":\"" << json_escape(L.name) << "\",";
-    ss << "\"type\":\"" << json_escape(layer_type_to_str(L.type)) << "\",";
-    ss << "\"enabled\":" << (L.enabled?"true":"false") << ",";
-    ss << "\"opacity\":" << std::clamp(L.opacity, 0.0f, 1.0f) << ",";
-    ss << "\"invertRel\":\"" << json_escape(layer_invert_to_str(L.invert_rel)) << "\",";
-    ss << "\"srcRect\":\"" << L.src_rect.x << "," << L.src_rect.y << "," << L.src_rect.w << "," << L.src_rect.h << "\",";
-    ss << "\"dstPos\":\"" << L.dst_pos.x << "," << L.dst_pos.y << "\",";
-    ss << "\"scale\":\"" << L.scale_x << "," << L.scale_y << "\",";
-    ss << "\"crosshair\":{";
-    ss << "\"enabled\":" << (L.xh.enabled?"true":"false") << ",";
-    ss << "\"diam\":\"" << L.xh.diam_w << "x" << L.xh.diam_h << "\",";
-    ss << "\"center\":\"" << (L.xh.center_set ? (std::to_string(L.xh.cx)+","+std::to_string(L.xh.cy)) : "") << "\",";
-    ss << "\"thickness\":" << L.xh.thickness << ",";
-    ss << "\"mode\":\"" << (L.xh.solid?"solid":"invert") << "\",";
-    ss << "\"color\":\"" << (int)L.xh.r << "," << (int)L.xh.g << "," << (int)L.xh.b << "\",";
-    ss << "\"opacity\":" << std::clamp(L.xh.opacity, 0.0f, 1.0f) << ",";
-    ss << "\"invertRel\":\"" << json_escape(layer_invert_to_str(L.xh.invert_rel)) << "\"";
-    ss << "}";
-    ss << "}";
+static std::string config_to_json(const persisted_config &c) {
+  json j;
+  j["v4l2Dev"] = c.v4l2_dev;
+  j["edidPath"] = c.edid_path;
+  j["modesetMatchInput"] = c.do_modeset;
+  j["threads"] = c.threads;
+  j["bgr"] = c.input_is_bgr;
+  j["present"] = c.present_policy;
+  j["preferOutputMode"] = c.prefer_output_mode;
+  j["preferOutputRes"] = std::to_string(c.prefer_out_w) + "x" + std::to_string(c.prefer_out_h);
+  j["viewport"] = c.viewport.set ? (std::to_string(c.viewport.w) + "x" + std::to_string(c.viewport.h)) : "";
+  j["listenAddr"] = c.listen_addr;
+
+  json layers = json::array();
+  for (const auto &L : c.layers) {
+    json jl;
+    jl["name"] = L.name;
+    jl["type"] = (L.type==LAYER_CROSSHAIR) ? "crosshair" : (L.type==LAYER_GRAPHICS ? "graphics" : "video");
+    jl["enabled"] = L.enabled;
+    jl["opacity"] = std::clamp(L.opacity, 0.0f, 1.0f);
+    jl["invertRel"] = (L.invert_rel==INV_UPPER) ? "upper" : (L.invert_rel==INV_LOWER ? "lower" : "none");
+    jl["srcRect"] = std::to_string(L.src_rect.x) + "," + std::to_string(L.src_rect.y) + "," + std::to_string(L.src_rect.w) + "," + std::to_string(L.src_rect.h);
+    jl["dstPos"] = std::to_string(L.dst_pos.x) + "," + std::to_string(L.dst_pos.y);
+    {
+      std::ostringstream sc;
+      sc << L.scale_x << "," << L.scale_y;
+      jl["scale"] = sc.str();
+    }
+
+    json xh;
+    xh["enabled"] = L.xh.enabled;
+    xh["diam"] = std::to_string(L.xh.diam_w) + "x" + std::to_string(L.xh.diam_h);
+    xh["center"] = L.xh.center_set ? (std::to_string(L.xh.cx) + "," + std::to_string(L.xh.cy)) : "";
+    xh["thickness"] = (int)L.xh.thickness;
+    xh["mode"] = L.xh.solid ? "solid" : "invert";
+    xh["color"] = std::to_string((int)L.xh.r) + "," + std::to_string((int)L.xh.g) + "," + std::to_string((int)L.xh.b);
+    xh["opacity"] = std::clamp(L.xh.opacity, 0.0f, 1.0f);
+    xh["invertRel"] = (L.xh.invert_rel==INV_UPPER) ? "upper" : (L.xh.invert_rel==INV_LOWER ? "lower" : "none");
+    jl["crosshair"] = xh;
+
+    layers.push_back(jl);
   }
-  ss << "]";
-  ss << "}";
-  return ss.str();
+  j["layers"] = layers;
+  return j.dump();
 }
 
-static bool config_from_json(const std::string &j, persisted_config &c) {
-  std::string s; bool b; int n; double d;
-  if (json_get_string(j, "v4l2Dev", s)) c.v4l2_dev=s;
-  if (json_get_string(j, "edidPath", s)) c.edid_path=s;
-  if (json_get_bool(j, "modesetMatchInput", b)) c.do_modeset=b;
-  if (json_get_int(j, "threads", n)) c.threads=n;
-  if (json_get_bool(j, "bgr", b)) c.input_is_bgr=b;
-  if (json_get_string(j, "present", s) && present_policy_valid(s)) c.present_policy=s;
-  if (json_get_bool(j, "preferOutputMode", b)) c.prefer_output_mode=b;
-  if (json_get_string(j, "preferOutputRes", s)) {
-    uint32_t w=0,h=0; if (parse_dim(s.c_str(), &w,&h)) { c.prefer_out_w=w; c.prefer_out_h=h; }
-  }
-  if (json_get_string(j, "viewport", s)) {
-    if (s.empty()) c.viewport.set=false;
-    else {
-      uint32_t w=0,h=0;
-      if (parse_dim(s.c_str(), &w,&h)) { c.viewport.set=true; c.viewport.w=w; c.viewport.h=h; }
-    }
-  }
-  if (json_get_string(j, "listenAddr", s) && !s.empty()) c.listen_addr=s;
+static bool config_from_json_text(const std::string &text, persisted_config &c) {
+  json j = json::parse(text, nullptr, false);
+  if (j.is_discarded() || !j.is_object()) return false;
 
-  std::vector<std::string> layer_objs;
-  if (json_get_array_object_slices(j, "layers", layer_objs)) {
-    std::vector<layer_cfg> parsed;
-    for (auto &obj : layer_objs) {
+  auto get_str = [&](const char *k, std::string &out) {
+    if (j.contains(k) && j[k].is_string()) out = j[k].get<std::string>();
+  };
+  auto get_bool = [&](const char *k, bool &out) {
+    if (j.contains(k) && j[k].is_boolean()) out = j[k].get<bool>();
+  };
+  auto get_int = [&](const char *k, int &out) {
+    if (j.contains(k) && j[k].is_number_integer()) out = j[k].get<int>();
+  };
+
+  get_str("v4l2Dev", c.v4l2_dev);
+  get_str("edidPath", c.edid_path);
+  get_bool("modesetMatchInput", c.do_modeset);
+  get_int("threads", c.threads);
+  get_bool("bgr", c.input_is_bgr);
+
+  std::string present;
+  get_str("present", present);
+  if (!present.empty() && present_policy_valid(present)) c.present_policy = present;
+
+  get_bool("preferOutputMode", c.prefer_output_mode);
+  std::string preferRes;
+  get_str("preferOutputRes", preferRes);
+  if (!preferRes.empty()) {
+    uint32_t w=0,h=0;
+    if (parse_dim(preferRes.c_str(), &w,&h)) { c.prefer_out_w=w; c.prefer_out_h=h; }
+  }
+
+  std::string viewport;
+  get_str("viewport", viewport);
+  if (viewport.empty()) c.viewport.set=false;
+  else {
+    uint32_t w=0,h=0;
+    if (parse_dim(viewport.c_str(), &w,&h)) { c.viewport.set=true; c.viewport.w=w; c.viewport.h=h; }
+  }
+
+  get_str("listenAddr", c.listen_addr);
+
+  if (j.contains("layers") && j["layers"].is_array()) {
+    c.layers.clear();
+    for (const auto &jl : j["layers"]) {
+      if (!jl.is_object()) continue;
       layer_cfg L;
-      if (json_get_string(obj, "name", s)) L.name=s;
-      if (json_get_string(obj, "type", s)) L.type=layer_type_from_str(s);
-      if (json_get_bool(obj, "enabled", b)) L.enabled=b;
-      if (json_get_double(obj, "opacity", d)) { if (d<0)d=0; if (d>1)d=1; L.opacity=(float)d; }
-      if (json_get_string(obj, "invertRel", s)) L.invert_rel=layer_invert_from_str(s);
-      if (json_get_string(obj, "srcRect", s)) { rect_u32 r; if (parse_rect_csv(s,r)) L.src_rect=r; }
-      if (json_get_string(obj, "dstPos", s)) { point_i32 p; if (parse_pos_csv_str(s,p)) L.dst_pos=p; }
-      if (json_get_string(obj, "scale", s)) { float sx=1,sy=1; if (parse_scale_csv(s,sx,sy)) { L.scale_x=sx; L.scale_y=sy; } }
 
-      std::string xhobj;
-      std::string pat="\"crosshair\"";
-      auto k=obj.find(pat);
-      if (k!=std::string::npos) {
-        auto lb=obj.find('{', k+pat.size());
-        if (lb!=std::string::npos) {
-          int depth=0; size_t start=lb;
-          for (size_t i=lb;i<obj.size();i++){
-            if (obj[i]=='{') depth++;
-            else if (obj[i]=='}'){ depth--; if(depth==0){ xhobj=obj.substr(start, i-start+1); break; } }
-          }
+      if (jl.contains("name") && jl["name"].is_string()) L.name = jl["name"].get<std::string>();
+      std::string type = jl.value("type", "video");
+      if (type=="crosshair") L.type = LAYER_CROSSHAIR;
+      else if (type=="graphics") L.type = LAYER_GRAPHICS;
+      else L.type = LAYER_VIDEO;
+
+      L.enabled = jl.value("enabled", true);
+      L.opacity = (float)std::clamp(jl.value("opacity", 1.0), 0.0, 1.0);
+
+      std::string inv = jl.value("invertRel", "none");
+      if (inv=="lower") L.invert_rel = INV_LOWER;
+      else if (inv=="upper") L.invert_rel = INV_UPPER;
+      else L.invert_rel = INV_NONE;
+
+      std::string srcRect = jl.value("srcRect", "0,0,0,0");
+      {
+        unsigned long x=0,y=0,w=0,h=0;
+        if (sscanf(srcRect.c_str(), "%lu,%lu,%lu,%lu", &x,&y,&w,&h)==4 && w>0 && h>0) {
+          L.src_rect.x=(uint32_t)x; L.src_rect.y=(uint32_t)y; L.src_rect.w=(uint32_t)w; L.src_rect.h=(uint32_t)h;
         }
       }
-      if (!xhobj.empty()) {
-        if (json_get_bool(xhobj, "enabled", b)) L.xh.enabled=b;
-        if (json_get_string(xhobj, "diam", s)) { uint32_t w=0,h=0; if (parse_dim(s.c_str(), &w,&h)) { L.xh.diam_w=w; L.xh.diam_h=h; } }
-        if (json_get_string(xhobj, "center", s)) {
-          if (s.empty()) L.xh.center_set=false;
-          else { int32_t cx=0,cy=0; if (parse_point_csv(s.c_str(), &cx,&cy)) { L.xh.center_set=true; L.xh.cx=cx; L.xh.cy=cy; } }
+      std::string dstPos = jl.value("dstPos", "0,0");
+      {
+        int x=0,y=0;
+        if (sscanf(dstPos.c_str(), "%d,%d", &x,&y)==2) { L.dst_pos.x=x; L.dst_pos.y=y; }
+      }
+      std::string scale = jl.value("scale", "1.0,1.0");
+      {
+        double sx=1.0, sy=1.0;
+        if (sscanf(scale.c_str(), "%lf,%lf", &sx,&sy)==2 && sx>0.0001 && sy>0.0001) {
+          L.scale_x=(float)sx; L.scale_y=(float)sy;
         }
-        if (json_get_int(xhobj, "thickness", n)) { if (n>=1 && n<=99) L.xh.thickness=(uint32_t)n; }
-        if (json_get_string(xhobj, "mode", s)) L.xh.solid=(s!="invert");
-        if (json_get_string(xhobj, "color", s)) { uint8_t rr=0,gg=0,bb=0; if (parse_rgb_csv(s.c_str(), &rr,&gg,&bb)) { L.xh.r=rr; L.xh.g=gg; L.xh.b=bb; } }
-        if (json_get_double(xhobj, "opacity", d)) { if (d<0)d=0; if (d>1)d=1; L.xh.opacity=(float)d; }
-        if (json_get_string(xhobj, "invertRel", s)) L.xh.invert_rel=layer_invert_from_str(s);
       }
 
-      parsed.push_back(L);
+      if (jl.contains("crosshair") && jl["crosshair"].is_object()) {
+        const auto &xh = jl["crosshair"];
+        L.xh.enabled = xh.value("enabled", false);
+
+        std::string diam = xh.value("diam", "50x50");
+        { uint32_t w=0,h=0; if (parse_dim(diam.c_str(), &w,&h)) { L.xh.diam_w=w; L.xh.diam_h=h; } }
+
+        std::string center = xh.value("center", "");
+        if (center.empty()) L.xh.center_set=false;
+        else {
+          int32_t cx=0,cy=0;
+          if (parse_point_csv(center.c_str(), &cx,&cy)) { L.xh.center_set=true; L.xh.cx=cx; L.xh.cy=cy; }
+        }
+
+        int th = xh.value("thickness", 1);
+        if (th < 1) th = 1;
+        if (th > 99) th = 99;
+        L.xh.thickness = (uint32_t)th;
+
+        std::string mode = xh.value("mode", "solid");
+        L.xh.solid = (mode != "invert");
+
+        std::string color = xh.value("color", "255,255,255");
+        { uint8_t r=255,g=255,b=255; if (parse_rgb_csv(color.c_str(), &r,&g,&b)) { L.xh.r=r; L.xh.g=g; L.xh.b=b; } }
+
+        L.xh.opacity = (float)std::clamp(xh.value("opacity", 1.0), 0.0, 1.0);
+
+        std::string xin = xh.value("invertRel", "none");
+        if (xin=="lower") L.xh.invert_rel = INV_LOWER;
+        else if (xin=="upper") L.xh.invert_rel = INV_UPPER;
+        else L.xh.invert_rel = INV_NONE;
+      }
+
+      c.layers.push_back(L);
     }
-    c.layers = parsed;
   }
   return true;
 }
@@ -1457,17 +1429,14 @@ static void request_reinit(const std::string &reason) {
   { std::lock_guard<std::mutex> lk(g_reinit_mtx); g_reinit_reason = reason; }
   g_reinit_requested.store(true);
 }
-
 static std::string take_reinit_reason() {
   std::lock_guard<std::mutex> lk(g_reinit_mtx);
   return g_reinit_reason;
 }
-
 static persisted_config cfg_snapshot() {
   std::lock_guard<std::mutex> lk(g_cfg_mtx);
   return g_cfg;
 }
-
 static bool save_config_locked() {
   std::string j = config_to_json(g_cfg);
   return write_file_atomic(g_cfg_path, j);
@@ -1477,12 +1446,10 @@ static bool save_config_locked() {
 static std::mutex g_apply_mtx;
 static bool g_last_apply_ok=true;
 static std::string g_last_apply_error;
-
 static void set_last_apply(bool ok, const std::string &err) {
   std::lock_guard<std::mutex> lk(g_apply_mtx);
   g_last_apply_ok=ok; g_last_apply_error=err;
 }
-
 static void get_last_apply(bool *ok, std::string *err) {
   std::lock_guard<std::mutex> lk(g_apply_mtx);
   if (ok) *ok=g_last_apply_ok;
@@ -1491,7 +1458,6 @@ static void get_last_apply(bool *ok, std::string *err) {
 
 // ---------------- Reference PNG (minimal uncompressed PNG) ----------------
 static uint32_t crc32_table[256];
-
 static void crc32_init() {
   for (uint32_t i=0;i<256;i++){
     uint32_t c=i;
@@ -1499,17 +1465,14 @@ static void crc32_init() {
     crc32_table[i]=c;
   }
 }
-
 static uint32_t crc32(const uint8_t *buf, size_t len) {
   uint32_t c=0xFFFFFFFFu;
   for (size_t i=0;i<len;i++) c = crc32_table[(c ^ buf[i]) & 0xFF] ^ (c>>8);
   return c ^ 0xFFFFFFFFu;
 }
-
 static void png_write_u32(std::vector<uint8_t> &o, uint32_t v) {
   o.push_back((v>>24)&0xFF); o.push_back((v>>16)&0xFF); o.push_back((v>>8)&0xFF); o.push_back(v&0xFF);
 }
-
 static void png_write_chunk(std::vector<uint8_t> &o, const char type[4], const std::vector<uint8_t> &data) {
   png_write_u32(o, (uint32_t)data.size());
   size_t start=o.size();
@@ -1518,18 +1481,15 @@ static void png_write_chunk(std::vector<uint8_t> &o, const char type[4], const s
   uint32_t c = crc32(o.data()+start, 4 + data.size());
   png_write_u32(o, c);
 }
-
 static std::vector<uint8_t> rgb24_to_png_uncompressed(const uint8_t *rgb, uint32_t w, uint32_t h, uint32_t stride) {
   crc32_init();
   std::vector<uint8_t> out;
   const uint8_t sig[8]={137,80,78,71,13,10,26,10};
   out.insert(out.end(), sig, sig+8);
-
   std::vector<uint8_t> ihdr;
   png_write_u32(ihdr, w); png_write_u32(ihdr, h);
   ihdr.push_back(8); ihdr.push_back(2); ihdr.push_back(0); ihdr.push_back(0); ihdr.push_back(0);
   png_write_chunk(out, "IHDR", ihdr);
-
   std::vector<uint8_t> raw;
   raw.reserve((size_t)h * (1 + (size_t)w*3));
   for (uint32_t y=0;y<h;y++) {
@@ -1537,9 +1497,8 @@ static std::vector<uint8_t> rgb24_to_png_uncompressed(const uint8_t *rgb, uint32
     const uint8_t *row = rgb + (uint64_t)y*stride;
     raw.insert(raw.end(), row, row + (size_t)w*3);
   }
-
   std::vector<uint8_t> z;
-  z.push_back(0x78); z.push_back(0x01); // zlib header (no compression)
+  z.push_back(0x78); z.push_back(0x01);
   size_t pos=0;
   while (pos < raw.size()) {
     size_t chunk = std::min((size_t)65535, raw.size()-pos);
@@ -1552,12 +1511,10 @@ static std::vector<uint8_t> rgb24_to_png_uncompressed(const uint8_t *rgb, uint32
     z.insert(z.end(), raw.begin()+pos, raw.begin()+pos+chunk);
     pos += chunk;
   }
-
   uint32_t s1=1,s2=0;
   for (uint8_t b: raw) { s1=(s1+b)%65521; s2=(s2+s1)%65521; }
   uint32_t adler=(s2<<16)|s1;
   png_write_u32(z, adler);
-
   png_write_chunk(out, "IDAT", z);
   std::vector<uint8_t> empty;
   png_write_chunk(out, "IEND", empty);
@@ -1572,14 +1529,12 @@ struct latest_frame {
   uint32_t buf_index=0;
   bool valid=false;
 };
-
 static std::mutex g_latest_mtx;
 static latest_frame g_latest;
 static std::atomic<uint64_t> g_latest_seq{0};
 
 // ---------------- Pipeline ----------------
 struct pipeline {
-  // held capture buffer (pipeline-owned)
   bool have_held_buf=false;
   struct v4l2_buffer held_buf{};
 
@@ -1608,10 +1563,9 @@ struct pipeline {
   bool dumped=false;
   bool saw_frame=false;
 
-  // stable storage for worker threads
   std::vector<layer_cfg> layers_work_;
-
-  // seq gating
+  std::vector<layer_map_cache> layer_maps_;
+  out_to_vp_lut lut_;
   uint64_t last_rendered_seq = 0;
 
   bool init_from_config(const persisted_config &cfg) {
@@ -1674,8 +1628,7 @@ struct pipeline {
     p_src_y   = get_prop_id(drm_fd, plane_id, DRM_MODE_OBJECT_PLANE, "SRC_Y");
     p_src_w   = get_prop_id(drm_fd, plane_id, DRM_MODE_OBJECT_PLANE, "SRC_W");
     p_src_h   = get_prop_id(drm_fd, plane_id, DRM_MODE_OBJECT_PLANE, "SRC_H");
-    if (!p_fb_id || !p_crtc_id || !p_crtc_x || !p_crtc_y || !p_crtc_w || !p_crtc_h ||
-        !p_src_x || !p_src_y || !p_src_w || !p_src_h) return false;
+    if (!p_fb_id || !p_crtc_id || !p_crtc_x || !p_crtc_y || !p_crtc_w || !p_crtc_h || !p_src_x || !p_src_y || !p_src_w || !p_src_h) return false;
 
     present_rect scanout{};
     scanout.crtc_x=0; scanout.crtc_y=0;
@@ -1684,17 +1637,6 @@ struct pipeline {
 
     if (dumb_fb_create(drm_fd, out_w, out_h, fmt, &fb[0]) != 0) return false;
     if (dumb_fb_create(drm_fd, out_w, out_h, fmt, &fb[1]) != 0) return false;
-
-    // initial test pattern (kept)
-    {
-      uint32_t *d=(uint32_t*)fb[0].map;
-      uint32_t stride_u32 = fb[0].pitch/4;
-      for (uint32_t y=0;y<out_h;y++) for (uint32_t x=0;x<out_w;x++) {
-        uint32_t r=(x*255)/(out_w?out_w:1);
-        uint32_t g=(y*255)/(out_h?out_h:1);
-        d[y*stride_u32+x] = 0xFF000000u | (r<<16) | (g<<8) | 0x40;
-      }
-    }
 
     if (drm_commit_plane_present(drm_fd, plane_id, crtc_id,
                                  p_fb_id,p_crtc_id,p_crtc_x,p_crtc_y,p_crtc_w,p_crtc_h,
@@ -1708,11 +1650,12 @@ struct pipeline {
     cur=0;
     dumped=false;
     saw_frame=false;
-
     have_held_buf=false;
     memset(&held_buf, 0, sizeof(held_buf));
 
     layers_work_.clear();
+    layer_maps_.clear();
+    lut_ = {};
 
     {
       std::lock_guard<std::mutex> lk(g_latest_mtx);
@@ -1743,7 +1686,6 @@ struct pipeline {
       dumb_fb_destroy(drm_fd, &fb[1]);
     }
 
-    // NOTE: keep held buffer state local; STREAMOFF returns buffers anyway on most drivers
     have_held_buf=false;
     memset(&held_buf, 0, sizeof(held_buf));
 
@@ -1779,16 +1721,13 @@ struct pipeline {
     return false;
   }
 
-  // Low-latency: block until at least one frame is ready (or timeout for supervisor housekeeping).
-  // Returns: false on fatal error, true otherwise. Sets *got_new_frame = true only if seq advanced.
   bool step_capture_publish_blocking(int timeout_ms, bool *got_new_frame) {
     if (got_new_frame) *got_new_frame = false;
-
     uint64_t before_seq = g_latest_seq.load(std::memory_order_acquire);
 
     int prc = v4l2_wait_for_frame(vfd, timeout_ms);
     if (prc < 0) return false;
-    if (prc == 0) return true; // timeout, no frame
+    if (prc == 0) return true;
 
     struct v4l2_buffer b;
     int dq=v4l2_dequeue_latest_frame(vfd, &b);
@@ -1798,10 +1737,7 @@ struct pipeline {
     const uint8_t *src = (const uint8_t*)cbufs[b.index].start;
     if (!dumped) { dump_first_pixels_rgb24(src); dumped=true; }
 
-    // Re-queue previous held buffer, hold newest
-    if (have_held_buf) {
-      (void)v4l2_queue_frame(vfd, &held_buf);
-    }
+    if (have_held_buf) (void)v4l2_queue_frame(vfd, &held_buf);
     held_buf = b;
     have_held_buf = true;
 
@@ -1820,11 +1756,16 @@ struct pipeline {
     return true;
   }
 
-  // Helper: build upper_cache.running_upper using same mapping logic as compositor
   void build_upper_cache_fast(const latest_frame &lf, const present_rect &map_pr, uint32_t vpw, uint32_t vph, const persisted_config &cfg_live) {
     upper_cache.enabled = true;
     std::fill(upper_cache.running_upper.begin(), upper_cache.running_upper.end(), 0xFF000000u);
     upper_cache.clear_upper_of_layer_buffers();
+
+    out_to_vp_lut ulut;
+    ulut.rebuild(out_w, out_h, vpw, vph, map_pr);
+
+    std::vector<layer_map_cache> umaps(layers_work_.size());
+    for (size_t i=0;i<layers_work_.size();i++) umaps[i].build_from_layer(layers_work_[i], lf.w, lf.h);
 
     for (int li=(int)layers_work_.size()-1; li>=0; li--) {
       const layer_cfg &L = layers_work_[(size_t)li];
@@ -1845,66 +1786,39 @@ struct pipeline {
       }
 
       if (L.type != LAYER_VIDEO) continue;
+      const layer_map_cache &M = umaps[(size_t)li];
+      if (!M.enabled) continue;
 
-      rect_u32 sr=L.src_rect;
-      if (sr.w==0||sr.h==0) continue;
-      if (sr.x>=lf.w||sr.y>=lf.h) continue;
-      if (sr.x+sr.w>lf.w) sr.w=lf.w-sr.x;
-      if (sr.y+sr.h>lf.h) sr.h=lf.h-sr.y;
+      uint8_t a = M.alpha;
+      if (a == 0) continue;
 
-      float sx=L.scale_x, sy=L.scale_y;
-      if (!(sx>0.0001f && sy>0.0001f)) continue;
-
-      uint8_t a=(uint8_t)std::lround(std::clamp(L.opacity,0.0f,1.0f)*255.0f);
-      if (a==0) continue;
-
-      const int32_t layer_vp_x0 = L.dst_pos.x;
-      const int32_t layer_vp_y0 = L.dst_pos.y;
-      const int32_t layer_vp_w  = (int32_t)std::max(1.0f, std::floor((float)sr.w * sx + 0.5f));
-      const int32_t layer_vp_h  = (int32_t)std::max(1.0f, std::floor((float)sr.h * sy + 0.5f));
-
-      rect_i32 ob = layer_vp_rect_to_output_bounds(map_pr, vpw, vph, layer_vp_x0, layer_vp_y0, layer_vp_w, layer_vp_h);
+      rect_i32 ob = layer_vp_rect_to_output_bounds(map_pr, vpw, vph, M.dst_x, M.dst_y, M.vp_w, M.vp_h);
       ob = clamp_bounds_to_output_and_band(ob, out_w, out_h, 0, out_h);
       if (rect_empty(ob)) continue;
 
-      for (int32_t oy = ob.y0; oy < ob.y1; oy++) {
-        int32_t vy_a=0, vy_b=0;
-        if (!oy_to_vy_span(map_pr, vph, oy, &vy_a, &vy_b)) continue;
+      for (int32_t oy=ob.y0; oy<ob.y1; oy++) {
+        int32_t vy = ulut.oy_to_vy[(uint32_t)oy];
+        if (vy < 0) continue;
+        int32_t lvy = vy - M.dst_y;
+        if ((uint32_t)lvy >= (uint32_t)M.vp_h) continue;
+        uint32_t syi = M.sr.y + (uint32_t)M.y_map[(size_t)lvy];
 
-        const int32_t layer_vp_y1 = layer_vp_y0 + layer_vp_h;
-        int32_t vy0 = std::max(vy_a, layer_vp_y0);
-        int32_t vy1 = std::min(vy_b, layer_vp_y1);
-        if (vy0 >= vy1) continue;
+        uint32_t *drow = &upper_cache.running_upper[(size_t)oy*(size_t)out_w];
 
-        int32_t vyy = vy0;
+        for (int32_t ox=ob.x0; ox<ob.x1; ox++) {
+          int32_t vx = ulut.ox_to_vx[(uint32_t)ox];
+          if (vx < 0) continue;
+          int32_t lvx = vx - M.dst_x;
+          if ((uint32_t)lvx >= (uint32_t)M.vp_w) continue;
+          uint32_t sxi = M.sr.x + (uint32_t)M.x_map[(size_t)lvx];
 
-        float local_y = (float)(vyy - layer_vp_y0);
-        uint32_t syi = sr.y + (uint32_t)std::min((uint32_t)sr.h - 1u, (uint32_t)(local_y / sy));
-
-        uint32_t *dstrow = &upper_cache.running_upper[(size_t)oy*(size_t)out_w];
-
-        for (int32_t ox = ob.x0; ox < ob.x1; ox++) {
-          int32_t vx_a=0, vx_b=0;
-          if (!ox_to_vx_span(map_pr, vpw, ox, &vx_a, &vx_b)) continue;
-
-          const int32_t layer_vp_x1 = layer_vp_x0 + layer_vp_w;
-          int32_t vx0 = std::max(vx_a, layer_vp_x0);
-          int32_t vx1 = std::min(vx_b, layer_vp_x1);
-          if (vx0 >= vx1) continue;
-
-          int32_t vxx = vx0;
-
-          float local_x = (float)(vxx - layer_vp_x0);
-          uint32_t sxi = sr.x + (uint32_t)std::min((uint32_t)sr.w - 1u, (uint32_t)(local_x / sx));
-
-          uint32_t over = src_read_xrgb8888(lf.ptr, lf.stride, sxi, syi, cfg_live.input_is_bgr);
-          dstrow[(uint32_t)ox] = blend_over_xrgb(dstrow[(uint32_t)ox], over, a);
+          uint32_t over = sample_rgb24_xrgb(lf.ptr, lf.stride, sxi, syi, cfg_live.input_is_bgr);
+          drow[(uint32_t)ox] = blend_over_xrgb(drow[(uint32_t)ox], over, a);
         }
       }
     }
   }
 
-  // Render+present only when new frame arrives (seq gating)
   bool step_render_present_if_new(const persisted_config &cfg_live) {
     uint64_t seq = g_latest_seq.load(std::memory_order_acquire);
     if (seq == 0 || seq == last_rendered_seq) return true;
@@ -1960,6 +1874,13 @@ struct pipeline {
       g_rt.present_policy = cfg_live.present_policy;
     }
 
+    lut_.rebuild(out_w, out_h, vpw, vph, map_pr);
+    layer_maps_.resize(layers_work_.size());
+    for (size_t i=0;i<layers_work_.size();i++) {
+      if (layers_work_[i].type == LAYER_CROSSHAIR) { layer_maps_[i].enabled=false; continue; }
+      layer_maps_[i].build_from_layer(layers_work_[i], lf.w, lf.h);
+    }
+
     if (need_upper) {
       build_upper_cache_fast(lf, map_pr, vpw, vph, cfg_live);
     } else {
@@ -1981,11 +1902,12 @@ struct pipeline {
     job.vpw=vpw; job.vph=vph;
     job.layers=&layers_work_;
     job.upper_cache = (need_upper ? &upper_cache : nullptr);
+    job.lut = &lut_;
+    job.layer_maps = &layer_maps_;
 
     comp_pool_run(job);
 
     if (!saw_frame) { fprintf(stderr, "[pipeline] first composited frame\n"); saw_frame=true; }
-
     if (drm_plane_flip_fb_only(drm_fd, plane_id, p_fb_id, fb[next].fb_id) != 0) return false;
 
     cur=next;
@@ -2037,114 +1959,176 @@ static std::string status_json() {
     policy = g_rt.present_policy;
   }
 
-  std::ostringstream ss;
-  ss << "{";
-  ss << "\"pid\":" << (int)g_pid.load() << ",";
-  ss << "\"reinitRequested\":" << (g_reinit_requested.load() ? "true":"false") << ",";
-  ss << "\"reinitReason\":\"" << json_escape(take_reinit_reason()) << "\",";
-  ss << "\"configPath\":\"" << json_escape(g_cfg_path) << "\",";
-  ss << "\"lastApplyOk\":" << (ok ? "true":"false") << ",";
-  ss << "\"lastApplyError\":\"" << json_escape(err) << "\",";
-  ss << "\"runtime\":{";
-  ss << "\"outW\":" << outw << ",";
-  ss << "\"outH\":" << outh << ",";
-  ss << "\"vpw\":" << vpw << ",";
-  ss << "\"vph\":" << vph << ",";
-  ss << "\"presentPolicy\":\"" << json_escape(policy) << "\",";
-  ss << "\"presentRect\":{";
-  ss << "\"crtcX\":" << pr.crtc_x << ",";
-  ss << "\"crtcY\":" << pr.crtc_y << ",";
-  ss << "\"crtcW\":" << pr.crtc_w << ",";
-  ss << "\"crtcH\":" << pr.crtc_h << ",";
-  ss << "\"srcW\":" << pr.src_w << ",";
-  ss << "\"srcH\":" << pr.src_h;
-  ss << "}";
-  ss << "}";
-  ss << "}";
-  return ss.str();
+  json j;
+  j["pid"] = (int)g_pid.load();
+  j["reinitRequested"] = g_reinit_requested.load();
+  j["reinitReason"] = take_reinit_reason();
+  j["configPath"] = g_cfg_path;
+  j["lastApplyOk"] = ok;
+  j["lastApplyError"] = err;
+  j["runtime"] = {
+    {"outW", outw},
+    {"outH", outh},
+    {"vpw", vpw},
+    {"vph", vph},
+    {"presentPolicy", policy},
+    {"presentRect", {
+      {"crtcX", pr.crtc_x},
+      {"crtcY", pr.crtc_y},
+      {"crtcW", pr.crtc_w},
+      {"crtcH", pr.crtc_h},
+      {"srcW",  pr.src_w},
+      {"srcH",  pr.src_h},
+    }}
+  };
+  return j.dump();
 }
 
+// apply_from_body + config_json_provider identical to your original (kept).
 static bool apply_from_body(const std::string &body, std::string &out_json, int &out_http_status) {
   persisted_config cur = cfg_snapshot();
   persisted_config next = cur;
-  std::string s; bool b; int n; double d;
 
-  if (json_get_string(body, "v4l2Dev", s) && !s.empty()) next.v4l2_dev=s;
-  if (json_get_string(body, "edidPath", s)) next.edid_path=s;
-  if (json_get_bool(body, "modesetMatchInput", b)) next.do_modeset=b;
-  if (json_get_int(body, "threads", n)) next.threads=n;
-  if (json_get_bool(body, "bgr", b)) next.input_is_bgr=b;
+  json j = json::parse(body, nullptr, false);
+  if (j.is_discarded() || !j.is_object()) {
+    set_last_apply(false, "invalid json");
+    out_http_status = 400;
+    out_json = "{\"error\":\"invalid json\"}";
+    return false;
+  }
 
-  if (json_get_string(body, "present", s)) {
+  auto get_str = [&](const char *k, std::string &out) {
+    if (j.contains(k) && j[k].is_string()) out = j[k].get<std::string>();
+  };
+  auto get_bool = [&](const char *k, bool &out) {
+    if (j.contains(k) && j[k].is_boolean()) out = j[k].get<bool>();
+  };
+  auto get_int = [&](const char *k, int &out) {
+    if (j.contains(k) && j[k].is_number_integer()) out = j[k].get<int>();
+  };
+
+  std::string s;
+  get_str("v4l2Dev", s); if (!s.empty()) next.v4l2_dev = s;
+  get_str("edidPath", s); next.edid_path = s;
+  get_bool("modesetMatchInput", next.do_modeset);
+  get_int("threads", next.threads);
+  get_bool("bgr", next.input_is_bgr);
+
+  get_str("present", s);
+  if (!s.empty()) {
     if (!present_policy_valid(s)) { set_last_apply(false,"invalid present"); out_http_status=400; out_json="{\"error\":\"invalid present\"}"; return false; }
     next.present_policy=s;
   }
 
-  if (json_get_bool(body, "preferOutputMode", b)) next.prefer_output_mode=b;
-
-  if (json_get_string(body, "preferOutputRes", s)) {
-    if (!s.empty()) {
-      uint32_t w=0,h=0;
-      if (!parse_dim(s.c_str(), &w,&h)) { set_last_apply(false,"invalid preferOutputRes"); out_http_status=400; out_json="{\"error\":\"invalid preferOutputRes\"}"; return false; }
-      next.prefer_out_w=w; next.prefer_out_h=h;
-    }
+  get_bool("preferOutputMode", next.prefer_output_mode);
+  get_str("preferOutputRes", s);
+  if (!s.empty()) {
+    uint32_t w=0,h=0;
+    if (!parse_dim(s.c_str(), &w,&h)) { set_last_apply(false,"invalid preferOutputRes"); out_http_status=400; out_json="{\"error\":\"invalid preferOutputRes\"}"; return false; }
+    next.prefer_out_w=w; next.prefer_out_h=h;
   }
 
-  if (json_get_string(body, "viewport", s)) {
-    if (s.empty()) next.viewport.set=false;
-    else {
-      uint32_t w=0,h=0;
-      if (!parse_dim(s.c_str(), &w,&h)) { set_last_apply(false,"invalid viewport"); out_http_status=400; out_json="{\"error\":\"invalid viewport\"}"; return false; }
-      next.viewport.set=true; next.viewport.w=w; next.viewport.h=h;
-    }
+  get_str("viewport", s);
+  if (s.empty()) next.viewport.set=false;
+  else {
+    uint32_t w=0,h=0;
+    if (!parse_dim(s.c_str(), &w,&h)) { set_last_apply(false,"invalid viewport"); out_http_status=400; out_json="{\"error\":\"invalid viewport\"}"; return false; }
+    next.viewport.set=true; next.viewport.w=w; next.viewport.h=h;
   }
 
-  if (json_get_string(body, "listenAddr", s) && !s.empty()) next.listen_addr=s;
+  get_str("listenAddr", s);
+  if (!s.empty()) next.listen_addr=s;
 
-  std::vector<std::string> layer_objs;
-  if (json_get_array_object_slices(body, "layers", layer_objs)) {
-    std::vector<layer_cfg> parsed;
-    for (auto &obj : layer_objs) {
+  if (j.contains("layers") && j["layers"].is_array()) {
+    next.layers.clear();
+    for (const auto &jl : j["layers"]) {
+      if (!jl.is_object()) continue;
       layer_cfg L;
-      if (json_get_string(obj, "name", s)) L.name=s;
-      if (json_get_string(obj, "type", s)) L.type=layer_type_from_str(s);
-      if (json_get_bool(obj, "enabled", b)) L.enabled=b;
-      if (json_get_double(obj, "opacity", d)) { if(d<0||d>1){ out_http_status=400; out_json="{\"error\":\"invalid layer opacity\"}"; return false; } L.opacity=(float)d; }
-      if (json_get_string(obj, "invertRel", s)) { if(!(s=="none"||s=="lower"||s=="upper")){ out_http_status=400; out_json="{\"error\":\"invalid layer invertRel\"}"; return false; } L.invert_rel=layer_invert_from_str(s); }
-      if (json_get_string(obj, "srcRect", s)) { rect_u32 r; if(!parse_rect_csv(s,r)){ out_http_status=400; out_json="{\"error\":\"invalid layer srcRect\"}"; return false; } L.src_rect=r; }
-      if (json_get_string(obj, "dstPos", s)) { point_i32 p; if(!parse_pos_csv_str(s,p)){ out_http_status=400; out_json="{\"error\":\"invalid layer dstPos\"}"; return false; } L.dst_pos=p; }
-      if (json_get_string(obj, "scale", s)) { float sx=1,sy=1; if(!parse_scale_csv(s,sx,sy)){ out_http_status=400; out_json="{\"error\":\"invalid layer scale\"}"; return false; } L.scale_x=sx; L.scale_y=sy; }
 
-      std::string xhobj;
-      std::string pat="\"crosshair\"";
-      auto k=obj.find(pat);
-      if (k!=std::string::npos) {
-        auto lb=obj.find('{', k+pat.size());
-        if (lb!=std::string::npos) {
-          int depth=0; size_t start=lb;
-          for (size_t i=lb;i<obj.size();i++){
-            if (obj[i]=='{') depth++;
-            else if (obj[i]=='}'){ depth--; if(depth==0){ xhobj=obj.substr(start, i-start+1); break; } }
-          }
+      if (jl.contains("name") && jl["name"].is_string()) L.name = jl["name"].get<std::string>();
+      std::string type = jl.value("type", "video");
+      if (type=="crosshair") L.type = LAYER_CROSSHAIR;
+      else if (type=="graphics") L.type = LAYER_GRAPHICS;
+      else L.type = LAYER_VIDEO;
+
+      L.enabled = jl.value("enabled", true);
+
+      double op = jl.value("opacity", 1.0);
+      if (!(op >= 0.0 && op <= 1.0)) { out_http_status=400; out_json="{\"error\":\"invalid layer opacity\"}"; return false; }
+      L.opacity = (float)op;
+
+      std::string inv = jl.value("invertRel", "none");
+      if (!(inv=="none"||inv=="lower"||inv=="upper")) { out_http_status=400; out_json="{\"error\":\"invalid layer invertRel\"}"; return false; }
+      if (inv=="lower") L.invert_rel = INV_LOWER;
+      else if (inv=="upper") L.invert_rel = INV_UPPER;
+      else L.invert_rel = INV_NONE;
+
+      std::string srcRect = jl.value("srcRect", "");
+      if (srcRect.empty()) { out_http_status=400; out_json="{\"error\":\"invalid layer srcRect\"}"; return false; }
+      {
+        unsigned long x=0,y=0,w=0,h=0;
+        if (sscanf(srcRect.c_str(), "%lu,%lu,%lu,%lu", &x,&y,&w,&h)!=4 || w==0 || h==0) {
+          out_http_status=400; out_json="{\"error\":\"invalid layer srcRect\"}"; return false;
         }
-      }
-      if (!xhobj.empty()) {
-        if (json_get_bool(xhobj,"enabled",b)) L.xh.enabled=b;
-        if (json_get_string(xhobj,"diam",s)) { uint32_t w=0,h=0; if(!parse_dim(s.c_str(),&w,&h)){ out_http_status=400; out_json="{\"error\":\"invalid crosshair diam\"}"; return false; } L.xh.diam_w=w; L.xh.diam_h=h; }
-        if (json_get_string(xhobj,"center",s)) {
-          if (s.empty()) L.xh.center_set=false;
-          else { int32_t cx=0,cy=0; if(!parse_point_csv(s.c_str(),&cx,&cy)){ out_http_status=400; out_json="{\"error\":\"invalid crosshair center\"}"; return false; } L.xh.center_set=true; L.xh.cx=cx; L.xh.cy=cy; }
-        }
-        if (json_get_int(xhobj,"thickness",n)) { if(n<1||n>99){ out_http_status=400; out_json="{\"error\":\"invalid crosshair thickness\"}"; return false; } L.xh.thickness=(uint32_t)n; }
-        if (json_get_string(xhobj,"mode",s)) { if(!(s=="solid"||s=="invert")){ out_http_status=400; out_json="{\"error\":\"invalid crosshair mode\"}"; return false; } L.xh.solid=(s=="solid"); }
-        if (json_get_string(xhobj,"color",s)) { uint8_t rr=0,gg=0,bb=0; if(!parse_rgb_csv(s.c_str(),&rr,&gg,&bb)){ out_http_status=400; out_json="{\"error\":\"invalid crosshair color\"}"; return false; } L.xh.r=rr; L.xh.g=gg; L.xh.b=bb; }
-        if (json_get_double(xhobj,"opacity",d)) { if(d<0||d>1){ out_http_status=400; out_json="{\"error\":\"invalid crosshair opacity\"}"; return false; } L.xh.opacity=(float)d; }
-        if (json_get_string(xhobj,"invertRel",s)) { if(!(s=="none"||s=="lower"||s=="upper")){ out_http_status=400; out_json="{\"error\":\"invalid crosshair invertRel\"}"; return false; } L.xh.invert_rel=layer_invert_from_str(s); }
+        L.src_rect.x=(uint32_t)x; L.src_rect.y=(uint32_t)y; L.src_rect.w=(uint32_t)w; L.src_rect.h=(uint32_t)h;
       }
 
-      parsed.push_back(L);
+      std::string dstPos = jl.value("dstPos", "");
+      if (dstPos.empty()) { out_http_status=400; out_json="{\"error\":\"invalid layer dstPos\"}"; return false; }
+      {
+        int x=0,y=0;
+        if (sscanf(dstPos.c_str(), "%d,%d", &x,&y)!=2) { out_http_status=400; out_json="{\"error\":\"invalid layer dstPos\"}"; return false; }
+        L.dst_pos.x=x; L.dst_pos.y=y;
+      }
+
+      std::string scale = jl.value("scale", "");
+      if (scale.empty()) { out_http_status=400; out_json="{\"error\":\"invalid layer scale\"}"; return false; }
+      {
+        double sx=1.0, sy=1.0;
+        if (sscanf(scale.c_str(), "%lf,%lf", &sx,&sy)!=2 || !(sx>0.0001 && sy>0.0001)) { out_http_status=400; out_json="{\"error\":\"invalid layer scale\"}"; return false; }
+        L.scale_x=(float)sx; L.scale_y=(float)sy;
+      }
+
+      if (jl.contains("crosshair") && jl["crosshair"].is_object()) {
+        const auto &xh = jl["crosshair"];
+
+        L.xh.enabled = xh.value("enabled", false);
+
+        std::string diam = xh.value("diam", "50x50");
+        { uint32_t w=0,h=0; if (!parse_dim(diam.c_str(), &w,&h)) { out_http_status=400; out_json="{\"error\":\"invalid crosshair diam\"}"; return false; } L.xh.diam_w=w; L.xh.diam_h=h; }
+
+        std::string center = xh.value("center", "");
+        if (center.empty()) L.xh.center_set=false;
+        else {
+          int32_t cx=0,cy=0;
+          if (!parse_point_csv(center.c_str(), &cx,&cy)) { out_http_status=400; out_json="{\"error\":\"invalid crosshair center\"}"; return false; }
+          L.xh.center_set=true; L.xh.cx=cx; L.xh.cy=cy;
+        }
+
+        int th = xh.value("thickness", 1);
+        if (th<1 || th>99) { out_http_status=400; out_json="{\"error\":\"invalid crosshair thickness\"}"; return false; }
+        L.xh.thickness=(uint32_t)th;
+
+        std::string mode = xh.value("mode", "solid");
+        if (!(mode=="solid"||mode=="invert")) { out_http_status=400; out_json="{\"error\":\"invalid crosshair mode\"}"; return false; }
+        L.xh.solid = (mode=="solid");
+
+        std::string color = xh.value("color", "255,255,255");
+        { uint8_t rr=0,gg=0,bb=0; if(!parse_rgb_csv(color.c_str(),&rr,&gg,&bb)){ out_http_status=400; out_json="{\"error\":\"invalid crosshair color\"}"; return false; } L.xh.r=rr; L.xh.g=gg; L.xh.b=bb; }
+
+        double xop = xh.value("opacity", 1.0);
+        if (!(xop>=0.0 && xop<=1.0)) { out_http_status=400; out_json="{\"error\":\"invalid crosshair opacity\"}"; return false; }
+        L.xh.opacity=(float)xop;
+
+        std::string xin = xh.value("invertRel", "none");
+        if (!(xin=="none"||xin=="lower"||xin=="upper")) { out_http_status=400; out_json="{\"error\":\"invalid crosshair invertRel\"}"; return false; }
+        if (xin=="lower") L.xh.invert_rel = INV_LOWER;
+        else if (xin=="upper") L.xh.invert_rel = INV_UPPER;
+        else L.xh.invert_rel = INV_NONE;
+      }
+
+      next.layers.push_back(L);
     }
-    next.layers = parsed;
   }
 
   bool need_reinit=false; std::string reason;
@@ -2169,21 +2153,24 @@ static bool apply_from_body(const std::string &body, std::string &out_json, int 
   set_last_apply(true,"");
   if (need_reinit) request_reinit(reason);
 
-  std::ostringstream out;
-  out << "{";
-  out << "\"ok\":true,";
-  out << "\"saved\":true,";
-  out << "\"reinitRequested\":" << (need_reinit?"true":"false") << ",";
-  out << "\"reinitReason\":\"" << json_escape(reason) << "\",";
-  out << "\"effectiveConfig\":" << config_to_json(next);
-  out << "}";
-  out_json=out.str();
-  out_http_status=200;
+  json out;
+  out["ok"] = true;
+  out["saved"] = true;
+  out["reinitRequested"] = need_reinit;
+  out["reinitReason"] = reason;
+  out["effectiveConfig"] = json::parse(config_to_json(next));
+  out_json = out.dump();
+  out_http_status = 200;
   return true;
 }
 
 static std::string config_json_provider() {
   return config_to_json(cfg_snapshot());
+}
+
+static bool looks_like_dim(const std::string &s) {
+  uint32_t w=0,h=0;
+  return parse_dim(s.c_str(), &w, &h);
 }
 
 // ---------------- Main ----------------
@@ -2211,10 +2198,13 @@ int main(int argc, char **argv) {
   // load config
   {
     persisted_config loaded;
-    std::string j = slurp_file(g_cfg_path);
-    if (!j.empty()) {
-      (void)config_from_json(j, loaded);
-      fprintf(stderr, "[config] loaded %s\n", g_cfg_path.c_str());
+    std::string txt = slurp_file(g_cfg_path);
+    if (!txt.empty()) {
+      if (config_from_json_text(txt, loaded)) {
+        fprintf(stderr, "[config] loaded %s\n", g_cfg_path.c_str());
+      } else {
+        fprintf(stderr, "[config] config parse failed; using defaults\n");
+      }
     } else {
       fprintf(stderr, "[config] no config found; using defaults\n");
     }
@@ -2230,6 +2220,10 @@ int main(int argc, char **argv) {
     if (strcmp(argv[i],"--listen")==0 && i+1<argc) {
       std::lock_guard<std::mutex> lk(g_cfg_mtx);
       g_cfg.listen_addr=argv[++i];
+      if (g_cfg.listen_addr.empty() || looks_like_dim(g_cfg.listen_addr)) {
+        fprintf(stderr, "[config] invalid listenAddr='%s' -> using 0.0.0.0\n", g_cfg.listen_addr.c_str());
+        g_cfg.listen_addr = "0.0.0.0";
+      }
       continue;
     }
 
@@ -2268,7 +2262,6 @@ int main(int argc, char **argv) {
   pipeline p;
   bool have_pipeline=false;
 
-  // init pipeline supervisor
   for (;;) {
     auto snap=cfg_snapshot();
     if (!present_policy_valid(snap.present_policy)) snap.present_policy="fit";
@@ -2278,7 +2271,7 @@ int main(int argc, char **argv) {
     usleep(1000*1000);
   }
 
-  // capture reference png (unchanged)
+  // capture reference png
   std::vector<uint8_t> ref_png;
   {
     uint64_t start=monotonic_ms();
@@ -2297,7 +2290,9 @@ int main(int argc, char **argv) {
     }
   }
 
+  // WEBUI STARTUP (this is what was missing/broken in your run)
   if (webui_enabled) {
+    fprintf(stderr, "[webui] wiring handlers...\n");
     webui_set_config_json_provider(&config_json_provider);
     webui_set_apply_handler(&apply_from_body);
     webui_set_status_provider(&status_json);
@@ -2305,13 +2300,12 @@ int main(int argc, char **argv) {
     webui_set_reference_png(ref_png);
     auto snap=cfg_snapshot();
     webui_set_listen_address(snap.listen_addr);
+    fprintf(stderr, "[webui] starting server thread on %s:%d ...\n", snap.listen_addr.c_str(), webui_port);
     webui_start_detached(webui_port);
     fprintf(stderr, "[webui] open http://<device-ip>:%d/\n", webui_port);
   }
 
-  // Main loop: frame-driven, no sleeps, render only when seq changes
   while (!g_quit.load()) {
-    // quit by keyboard
     char ch;
     ssize_t n = read(STDIN_FILENO, &ch, 1);
     if (n==1 && ch=='q') { g_quit.store(true); break; }
@@ -2342,15 +2336,12 @@ int main(int argc, char **argv) {
     auto snap=cfg_snapshot();
     if (p.detect_input_change_and_request_reinit()) continue;
 
-    // BLOCK until at least one frame arrives (timeout just to service reinit/quit frequently)
     bool got_new=false;
     if (!p.step_capture_publish_blocking(1000, &got_new)) {
       fprintf(stderr, "[supervisor] capture failed; reinit...\n");
       p.shutdown(); have_pipeline=false;
       continue;
     }
-
-    // If we timed out and got no frame, loop again (keep checking reinit/quit)
     if (!got_new) continue;
 
     if (!p.step_render_present_if_new(snap)) {

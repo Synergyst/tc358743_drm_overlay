@@ -5,10 +5,8 @@
 #include <vector>
 #include <sstream>
 #include <cstdio>
-
 #include "third_party/httplib.h"
 #include "tc358743_webui.h"
-
 static std::mutex g_mtx;
 static std::string (*g_cfg_json)() = nullptr;
 static bool (*g_apply)(const std::string&, std::string&, int&) = nullptr;
@@ -17,7 +15,6 @@ static std::string (*g_filter_defs)() = nullptr;
 static std::atomic<bool> *g_quit = nullptr;
 static std::vector<uint8_t> g_ref_png;
 static std::string g_listen_addr = "0.0.0.0";
-
 void webui_set_config_json_provider(std::string (*fn)()) {
   std::lock_guard<std::mutex> lk(g_mtx);
   g_cfg_json = fn;
@@ -50,7 +47,6 @@ void webui_set_filter_defs_provider(std::string (*fn)()) {
 void webui_set_filters_provider(std::string (*fn)()) {
   webui_set_filter_defs_provider(fn);
 }
-
 /*
   Notes re: per-layer filter stacks (video layers only for now):
   - UI stores filters as: layer.filters = [{id, enabled, params}, ...]
@@ -105,6 +101,7 @@ static const char *kIndexHtml = R"HTML(<!doctype html>
     .rowBtns button { background:#1b2436; color:var(--fg); border:1px solid var(--line); padding:10px 12px; border-radius:10px; cursor:pointer; font-weight:700; }
     .rowBtns button.primary { background:var(--accent); color:#08121f; border:0; font-weight:900; }
     .rowBtns button.warn { background: #2a2413; border:1px solid #56451a; color:#ffe7a6; }
+    .rowBtns button.danger { background:#2a1212; border:1px solid #5d2a2a; color:#ffd6d6; }
     .rowBtns .pill { padding:6px 10px; border:1px solid var(--line); border-radius:999px; font-size:12px; color: var(--muted); background: rgba(0,0,0,0.15); }
     table { width:100%; border-collapse:collapse; font-size:12px; }
     th,td { border-top:1px solid var(--line); padding:8px; vertical-align:top; }
@@ -114,7 +111,7 @@ static const char *kIndexHtml = R"HTML(<!doctype html>
     .card .hd2 { display:flex; align-items:center; justify-content:space-between; gap:10px; margin-bottom:8px; }
     .chip { font-size:12px; border:1px solid var(--line); border-radius:999px; padding:4px 8px; color:var(--muted); }
     .err { color:#ffd6d6; background: rgba(255,93,93,0.12); border:1px solid rgba(255,93,93,0.35); border-radius:12px; padding:10px; }
-    .help { font-size: 12px; color: var(--muted); line-height: 1.35; }
+    .help { font-size: 12px; color:var(--muted); line-height: 1.35; }
     .hr { height:1px; background: var(--line); margin: 12px 0; }
     .sectionTitle { font-weight:900; margin:0 0 6px 0; font-size: 13px; }
     .kbd { font-family: var(--mono); border:1px solid var(--line); background: rgba(0,0,0,0.2); border-radius: 6px; padding: 2px 6px; font-size: 12px; color: var(--muted); }
@@ -287,6 +284,12 @@ static const char *kIndexHtml = R"HTML(<!doctype html>
           <div>
             <label>V4L2 Device</label>
             <input id="v4l2Dev" type="text" placeholder="/dev/video0"/>
+            <div class="help">Default source used by new video layers (unless layer overrides videoSource).</div>
+          </div>
+          <div>
+            <label>V4L2 Sources (CSV)</label>
+            <input id="v4l2Sources" class="mono" type="text" placeholder="/dev/video0,/dev/video1"/>
+            <div class="help">Optional list of sources; used for per-layer selection and status display.</div>
           </div>
           <div>
             <label>EDID Path</label>
@@ -391,9 +394,15 @@ static const char *kIndexHtml = R"HTML(<!doctype html>
             </div>
           </div>
           <div class="hr"></div>
+
           <div id="videoInspector" style="display:none;">
             <div class="sectionTitle">Video layer</div>
             <div class="grid2">
+              <div>
+                <label>Source (videoSource)</label>
+                <select id="iVideoSource"></select>
+                <div class="help" id="iVideoSourceHelp">Auto-disables at runtime if selected source is not active.</div>
+              </div>
               <div>
                 <label>srcRect (x,y,w,h)</label>
                 <input id="iSrcRect" class="mono" type="text" placeholder="0,0,640,360"/>
@@ -430,6 +439,7 @@ static const char *kIndexHtml = R"HTML(<!doctype html>
             <div style="height:10px;"></div>
             <div id="filtersBox" class="fStack"></div>
           </div>
+
           <div id="crossInspector" style="display:none;">
             <div class="sectionTitle">Crosshair layer</div>
             <div class="grid2">
@@ -484,6 +494,7 @@ static const char *kIndexHtml = R"HTML(<!doctype html>
               that’s backend-side, not UI.
             </div>
           </div>
+
         </div>
       </div>
       <div style="height:12px;"></div>
@@ -497,6 +508,7 @@ static const char *kIndexHtml = R"HTML(<!doctype html>
     </div>
   </div>
 </div>
+
 <script>
 const LIMITS = {
   opacity: {min:0, max:1},
@@ -504,11 +516,13 @@ const LIMITS = {
   scale: {min:0.0001, max:64},
   dim: {min:1, max:16384},
 };
+
 function clamp(v, lo, hi){ return Math.min(hi, Math.max(lo, v)); }
 function isNum(x){ return typeof x === 'number' && isFinite(x); }
 function round(v){ return Math.round(v); }
 function fmt(v){ return (Math.round(v*10000)/10000).toString(); }
 function deepClone(o){ return JSON.parse(JSON.stringify(o)); }
+
 function parseDimWxH(s){
   if (!s) return null;
   const m = String(s).trim().match(/^(\d+)\s*[xX]\s*(\d+)$/);
@@ -545,6 +559,11 @@ function parseRGB(s){
   if (!v) return null;
   return {r:v[0], g:v[1], b:v[2]};
 }
+function parseCSVStrings(s){
+  if (!s) return [];
+  return String(s).split(',').map(x => x.trim()).filter(x => x.length);
+}
+
 async function api(path, opts) {
   const r = await fetch(path, opts);
   const t = await r.text();
@@ -557,10 +576,12 @@ async function api(path, opts) {
 let cfg = null;
 let selectedIdx = -1;
 let runtime = null;
+
 let ui = {
   mode: 'select',
   crop: { active:false, rect:null, drag:null }
 };
+
 let stage = {
   vpw: 0,
   vph: 0,
@@ -569,6 +590,7 @@ let stage = {
   imgNaturalW: 0,
   imgNaturalH: 0,
 };
+
 let stageDrag = null;
 
 // Filter registry
@@ -607,33 +629,25 @@ const FILTER_FALLBACK = {
 };
 
 function schemaForKnownFilterId(id){
-  // Used when backend /api/filters returns params as an object (defaults only).
   if (id === 'mono') return FILTER_FALLBACK.filters[0].params;
   if (id === 'sobel') return FILTER_FALLBACK.filters[1].params;
   return [];
 }
-
 function normalizeFilterDef(def){
-  // Ensures def._params is always an array of param-descriptors.
   if (!def || typeof def !== 'object') return { id:'', name:'', _params:[] };
   const out = {...def};
   const p = out.params;
-
   if (Array.isArray(p)) {
     out._params = p;
   } else if (p && typeof p === 'object') {
-    // Backend may return params as defaults object (e.g. {"mode":"edgesOnly","threshold":64,...}).
-    // Synthesize schema for known ids so coercion + UI editing works.
     out._params = schemaForKnownFilterId(out.id);
   } else {
     out._params = schemaForKnownFilterId(out.id);
   }
-
   if (!out.id) out.id = '';
   if (!out.name) out.name = out.id;
   return out;
 }
-
 function normalizeFilterDefsObj(obj){
   const o = (obj && typeof obj === 'object') ? obj : {};
   const arr = Array.isArray(o.filters) ? o.filters : [];
@@ -646,7 +660,6 @@ function getFilterDefs(){
 function findFilterDef(id){
   return (getFilterDefs().filters || []).find(f => f.id === id) || null;
 }
-
 function coerceFilterParamsInPlace(f){
   const def = findFilterDef(f.id);
   if (!def) return;
@@ -655,9 +668,7 @@ function coerceFilterParamsInPlace(f){
     const k = p.k;
     if (!f.params) f.params = {};
     const v = f.params[k];
-
     if (p.type === 'bool') {
-      // accept true/false, "true"/"false", 0/1
       if (typeof v === 'boolean') return;
       if (typeof v === 'string') f.params[k] = (v.toLowerCase() === 'true');
       else if (typeof v === 'number') f.params[k] = (v !== 0);
@@ -683,7 +694,6 @@ function coerceFilterParamsInPlace(f){
     }
   });
 }
-
 function makeDefaultFilterInstance(id){
   const def = findFilterDef(id);
   if (!def) return { id, enabled:true, params:{} };
@@ -698,7 +708,6 @@ function makeDefaultFilterInstance(id){
   });
   return { id, enabled:true, params };
 }
-
 function ensureVideoFilterDefaults(L){
   if (!L.filters || !Array.isArray(L.filters)) L.filters = [];
   L.filters = L.filters.map(f => {
@@ -706,16 +715,13 @@ function ensureVideoFilterDefaults(L){
     if (!f.id) f.id = "mono";
     if (f.enabled === undefined) f.enabled = true;
     if (!f.params || typeof f.params !== 'object') f.params = {};
-
     const def = findFilterDef(f.id);
     if (def) {
       (def._params || []).forEach(p => {
         if (f.params[p.k] === undefined && p.default !== undefined) f.params[p.k] = p.default;
       });
     }
-    // Ensure type coercion always happens even if schema came from /api/filters defaults object.
     coerceFilterParamsInPlace(f);
-
     return f;
   });
   return L;
@@ -727,10 +733,18 @@ function ensureLayerDefaults(L){
   if (L.enabled === undefined) L.enabled = true;
   if (!isNum(L.opacity)) L.opacity = 1.0;
   if (!L.invertRel) L.invertRel = "none";
+
+  // NEW: per-video-layer videoSource
+  if (L.type === 'video') {
+    if (L.videoSource === undefined) L.videoSource = "";
+    if (typeof L.videoSource !== 'string') L.videoSource = String(L.videoSource ?? "");
+  }
+
   if (!L.srcRect || !parseRect(L.srcRect)) L.srcRect = "0,0,1,1";
   if (!L.dstPos  || !parsePos(L.dstPos))   L.dstPos  = "0,0";
   if (!L.scale   || !parseScale(L.scale))  L.scale   = "1.0,1.0";
   if (L.type === 'video') ensureVideoFilterDefaults(L);
+
   if (!L.crosshair) {
     L.crosshair = {enabled:false, diam:"50x50", center:"", thickness:1, mode:"solid", color:"255,255,255", opacity:1.0, invertRel:"none"};
   } else {
@@ -758,6 +772,11 @@ function normalizeCfg(c){
   if (c.preferOutputMode === undefined) c.preferOutputMode = true;
   if (!c.preferOutputRes) c.preferOutputRes = "1280x720";
   if (c.viewport === undefined) c.viewport = "";
+
+  // NEW: v4l2Sources array (optional)
+  if (!Array.isArray(c.v4l2Sources)) c.v4l2Sources = [];
+  c.v4l2Sources = c.v4l2Sources.map(String).filter(s => s.length);
+
   return c;
 }
 
@@ -797,6 +816,7 @@ function updateStageMetrics(){
   stage.vpw = v.vpw;
   stage.vph = v.vph;
 }
+
 function vpToStageX(v){ return v * (stage.stageW / stage.vpw); }
 function vpToStageY(v){ return v * (stage.stageH / stage.vph); }
 function stageToVpX(px){ return px * (stage.vpw / stage.stageW); }
@@ -812,6 +832,7 @@ function computeLayerBoxVP(L){
   if (!isFinite(h) || h < 1) h = 1;
   return {x: dp.x, y: dp.y, w, h};
 }
+
 function writeLayerFromBoxVP(L, box){
   const sr = parseRect(L.srcRect) || {x:0,y:0,w:1,h:1};
   const sw = Math.max(1, sr.w);
@@ -821,10 +842,12 @@ function writeLayerFromBoxVP(L, box){
   L.dstPos = `${round(box.x)},${round(box.y)}`;
   L.scale = `${fmt(sx)},${fmt(sy)}`;
 }
+
 function snap(v, step, enabled){
   if (!enabled) return v;
   return Math.round(v / step) * step;
 }
+
 function renderVPHelp(){
   const el = document.getElementById('vpHelp');
   if (!el) return;
@@ -840,6 +863,7 @@ function renderVPHelp(){
   }
   el.innerHTML = `Viewport coordinate space: <strong>${d.w}×${d.h}</strong>`;
 }
+
 function clampLayerSrcRectToCaptureProxy(L){
   const sr = parseRect(L.srcRect);
   if (!sr) return;
@@ -854,6 +878,39 @@ function clampLayerSrcRectToCaptureProxy(L){
   if (x + w > W) w = Math.max(1, W - x);
   if (y + h > H) h = Math.max(1, H - y);
   L.srcRect = `${round(x)},${round(y)},${round(w)},${round(h)}`;
+}
+
+/*** Add layer helpers ***/
+function nextVideoLayerName(){
+  const used = new Set();
+  (cfg && cfg.layers ? cfg.layers : []).forEach(L => {
+    const nm = (L && typeof L.name === 'string') ? L.name : '';
+    const m = nm.match(/^Video\s+(\d+)$/i);
+    if (m) used.add(Number(m[1]));
+  });
+  let n = 1;
+  while (used.has(n)) n++;
+  return `Video ${n}`;
+}
+
+function makeDefaultVideoLayer(){
+  const W = stage.imgNaturalW || 0;
+  const H = stage.imgNaturalH || 0;
+  const srcRect = (W > 0 && H > 0) ? `0,0,${round(W)},${round(H)}` : "0,0,1,1";
+  const L = {
+    name: nextVideoLayerName(),
+    type: "video",
+    enabled: true,
+    opacity: 1.0,
+    invertRel: "none",
+    srcRect,
+    dstPos: "0,0",
+    scale: "1.0,1.0",
+    filters: [],
+    videoSource: "" // NEW: empty means "use cfg.v4l2Dev"
+  };
+  ensureLayerDefaults(L);
+  return L;
 }
 
 /*** Stage pointer handling ***/
@@ -1007,7 +1064,7 @@ function commitCrop(){
   alert("Crop logic unchanged; not included in this script snippet. Ask me to include it fully.");
 }
 
-/*** Rendering (minimal guards; your existing full versions can remain) ***/
+/*** Rendering ***/
 function renderStage(){
   if (!cfg) return;
   updateStageMetrics();
@@ -1029,7 +1086,8 @@ function renderStage(){
     el.style.opacity = String(clamp(Number(L.opacity ?? 1),0,1));
     const lab = document.createElement('div');
     lab.className = 'label';
-    lab.textContent = `${idx}: ${L.name||'Layer'}`;
+    const src = (L.videoSource && L.videoSource.length) ? L.videoSource : (cfg.v4l2Dev || '');
+    lab.textContent = `${idx}: ${L.name||'Layer'} ${src ? '['+src+']' : ''}`;
     el.appendChild(lab);
     const inner = document.createElement('div');
     inner.className = 'inner';
@@ -1049,6 +1107,7 @@ function renderStage(){
 function renderCrosshairPreview(){
   if (!cfg) return;
 }
+
 function renderLayersTable(){
   if (!cfg) return;
   const tb = document.getElementById('layersTable');
@@ -1099,7 +1158,13 @@ function renderLayersTable(){
       btn.onclick = () => {
         const a = btn.getAttribute('data-act');
         if (a==='sel'){ selectedIdx = idx; setMode('select'); renderAll(); }
-        if (a==='del'){ cfg.layers.splice(idx,1); if(selectedIdx===idx) selectedIdx=-1; if(selectedIdx>idx) selectedIdx--; setMode('select'); renderAll(); }
+        if (a==='del'){
+          cfg.layers.splice(idx,1);
+          if(selectedIdx===idx) selectedIdx=-1;
+          if(selectedIdx>idx) selectedIdx--;
+          setMode('select');
+          renderAll();
+        }
         if (a==='dup'){
           const copy = deepClone(cfg.layers[idx]);
           copy.name = (copy.name||'Layer') + "_copy";
@@ -1132,7 +1197,6 @@ function renderFiltersUIForLayer(L){
   const addSel = document.getElementById('fAddType');
   const addBtn = document.getElementById('btnAddFilter');
   if (!box || !chip || !addSel || !addBtn) return;
-
   if (!L || L.type !== 'video') {
     box.innerHTML = '';
     chip.textContent = '0';
@@ -1140,27 +1204,20 @@ function renderFiltersUIForLayer(L){
     addSel.disabled = true;
     return;
   }
-
   addBtn.disabled = false;
   addSel.disabled = false;
-
   ensureVideoFilterDefaults(L);
   chip.textContent = `${L.filters.length}`;
-
   renderFilterAddSelect();
-
   addBtn.onclick = () => {
     const id = addSel.value;
     L.filters.push(makeDefaultFilterInstance(id));
     validateCfg();
     renderInspector();
   };
-
   box.innerHTML = '';
   L.filters.forEach((f, idx) => {
-    // Ensure schema-coerced values before rendering (prevents bool->string drift)
     coerceFilterParamsInPlace(f);
-
     const def = findFilterDef(f.id);
     const name = def ? def.name : f.id;
     const el = document.createElement('div');
@@ -1181,21 +1238,17 @@ function renderFiltersUIForLayer(L){
       </div>
       <div class="params"></div>
     `;
-
     const paramsEl = el.querySelector('.params');
     const params = def ? (def._params || []) : [];
-
     if (params.length === 0) {
       paramsEl.innerHTML = `<div class="help mono">no params</div>`;
     } else {
       params.forEach(p => {
         const wrap = document.createElement('div');
         const key = p.k;
-
         const label = document.createElement('label');
         label.textContent = key;
         wrap.appendChild(label);
-
         let input;
         if (p.type === 'enum') {
           input = document.createElement('select');
@@ -1229,29 +1282,22 @@ function renderFiltersUIForLayer(L){
           input.type = 'text';
           input.value = String(f.params[key] ?? p.default ?? '');
         }
-
         input.onchange = () => {
           if (p.type === 'bool') f.params[key] = !!input.checked;
           else if (p.type === 'int') f.params[key] = Number(input.value);
           else if (p.type === 'float') f.params[key] = Number(input.value);
           else f.params[key] = input.value;
-
-          // Immediately coerce after any edit to keep types stable for /api/apply
           coerceFilterParamsInPlace(f);
-
           validateCfg();
         };
-
         wrap.appendChild(input);
         paramsEl.appendChild(wrap);
       });
     }
-
     el.querySelector('input[data-k="enabled"]').onchange = (ev) => {
       f.enabled = !!ev.target.checked;
       validateCfg();
     };
-
     el.querySelectorAll('button').forEach(btn => {
       btn.onclick = () => {
         const act = btn.getAttribute('data-act');
@@ -1279,9 +1325,105 @@ function renderFiltersUIForLayer(L){
         }
       };
     });
-
     box.appendChild(el);
   });
+}
+
+// ---- Source list helpers (NEW) ----
+function getKnownSources(){
+  // sources from config + from runtime status (if present)
+  const set = new Set();
+  const arr = [];
+  const add = (s) => {
+    if (!s || !String(s).trim()) return;
+    const v = String(s).trim();
+    if (set.has(v)) return;
+    set.add(v);
+    arr.push(v);
+  };
+
+  if (cfg && cfg.v4l2Dev) add(cfg.v4l2Dev);
+  if (cfg && Array.isArray(cfg.v4l2Sources)) cfg.v4l2Sources.forEach(add);
+
+  const rtSources = runtime && runtime.runtime && Array.isArray(runtime.runtime.sources) ? runtime.runtime.sources : [];
+  rtSources.forEach(x => add(x.dev));
+
+  // common defaults
+  add("/dev/video0");
+  add("/dev/video1");
+  return arr;
+}
+function getActiveSourcesFromRuntime(){
+  const rtSources = runtime && runtime.runtime && Array.isArray(runtime.runtime.sources) ? runtime.runtime.sources : [];
+  return rtSources.filter(s => !!s.active).map(s => s.dev);
+}
+function renderVideoSourceSelectForLayer(L){
+  const sel = document.getElementById('iVideoSource');
+  const help = document.getElementById('iVideoSourceHelp');
+  if (!sel || !help) return;
+
+  if (!L || L.type !== 'video') {
+    sel.innerHTML = '';
+    sel.disabled = true;
+    help.textContent = '';
+    return;
+  }
+
+  sel.disabled = false;
+
+  const known = getKnownSources();
+  const active = new Set(getActiveSourcesFromRuntime());
+
+  // Determine currently selected
+  const cur = (L.videoSource && L.videoSource.length) ? L.videoSource : "";
+
+  sel.innerHTML = '';
+
+  // Option: inherit default (empty string)
+  {
+    const opt = document.createElement('option');
+    opt.value = "";
+    const def = (cfg && cfg.v4l2Dev) ? cfg.v4l2Dev : "";
+    opt.textContent = def ? `default (${def})` : 'default';
+    if (cur === "") opt.selected = true;
+    sel.appendChild(opt);
+  }
+
+  known.forEach(dev => {
+    const opt = document.createElement('option');
+    opt.value = dev;
+    opt.textContent = active.has(dev) ? `${dev} (active)` : `${dev}`;
+    if (cur === dev) opt.selected = true;
+    sel.appendChild(opt);
+  });
+
+  // If the current value isn't in known list, add it so it doesn't get lost.
+  if (cur && !known.includes(cur)) {
+    const opt = document.createElement('option');
+    opt.value = cur;
+    opt.textContent = `${cur} (custom)`;
+    opt.selected = true;
+    sel.appendChild(opt);
+  }
+
+  sel.onchange = () => {
+    L.videoSource = sel.value; // may be "" (inherit)
+    validateCfg();
+    renderStage();
+    renderInspector();
+  };
+
+  // Update help with runtime active info
+  const effective = cur ? cur : (cfg && cfg.v4l2Dev ? cfg.v4l2Dev : "");
+  if (!effective) {
+    help.textContent = "No default source configured.";
+  } else if (active.size) {
+    help.textContent = active.has(effective)
+      ? `Effective source ${effective} is active.`
+      : `Effective source ${effective} is not active (layer will be auto-disabled by backend).`;
+  } else {
+    help.textContent = `Effective source ${effective}. (No runtime source status yet.)`;
+  }
 }
 
 function renderInspector(){
@@ -1291,25 +1433,22 @@ function renderInspector(){
   const body = document.getElementById('inspectorBody');
   const vid = document.getElementById('videoInspector');
   const xh = document.getElementById('crossInspector');
-
   if (selectedIdx < 0 || selectedIdx >= cfg.layers.length) {
     chip.textContent = 'no selection';
     help.textContent = 'Select a layer by clicking it in the viewport or in the table.';
     body.style.display = 'none';
     return;
   }
-
   const L = cfg.layers[selectedIdx];
   ensureLayerDefaults(L);
-
   chip.textContent = `#${selectedIdx} ${L.name || 'Layer'} (${L.type})`;
   help.textContent = (L.type === 'video')
     ? 'Drag/resize in viewport; dstPos/scale update live.'
     : (L.type === 'crosshair')
-      ? 'Crosshair preview shown in viewport.'
+      ? 'Crosshair preview shown in the viewport.'
       : 'Layer type not fully implemented yet.';
-
   body.style.display = 'block';
+
   document.getElementById('iName').value = L.name || '';
   document.getElementById('iType').value = L.type || 'video';
   document.getElementById('iEnabled').checked = !!L.enabled;
@@ -1320,6 +1459,7 @@ function renderInspector(){
   xh.style.display  = (L.type === 'crosshair') ? 'block' : 'none';
 
   if (L.type === 'video') {
+    renderVideoSourceSelectForLayer(L);
     document.getElementById('iSrcRect').value = L.srcRect || '0,0,1,1';
     document.getElementById('iDstPos').value = L.dstPos || '0,0';
     document.getElementById('iScale').value = L.scale || '1.0,1.0';
@@ -1330,9 +1470,16 @@ function renderInspector(){
 function validateCfg(){
   if (!cfg) return [];
   const errors = [];
+
+  // Validate v4l2Sources field if present
+  if (cfg.v4l2Sources && !Array.isArray(cfg.v4l2Sources)) errors.push("v4l2Sources must be array");
+
   cfg.layers.forEach((L, idx) => {
     ensureLayerDefaults(L);
+
     if (L.type === 'video') {
+      // videoSource is optional but must be string
+      if (L.videoSource !== undefined && typeof L.videoSource !== 'string') errors.push(`layer ${idx}: videoSource must be string`);
       ensureVideoFilterDefaults(L);
       L.filters.forEach((f, fi) => {
         if (!f.id || typeof f.id !== 'string') errors.push(`layer ${idx} filter ${fi}: missing id`);
@@ -1353,6 +1500,7 @@ function validateCfg(){
       });
     }
   });
+
   const box = document.getElementById('validationBox');
   if (box) {
     if (errors.length === 0) {
@@ -1369,9 +1517,14 @@ function validateCfg(){
 async function refreshStatus(){
   try {
     const st = await api('/api/status');
-    runtime = (st && st.runtime) ? st.runtime : null;
+    runtime = st || null;
     const s = document.getElementById('status');
     if (s) s.textContent = JSON.stringify(st, null, 2);
+
+    // update inspector source help text if open
+    if (cfg && selectedIdx >= 0 && selectedIdx < cfg.layers.length) {
+      renderInspector();
+    }
   } catch (e) {
     const s = document.getElementById('status');
     if (s) s.textContent = `status error: ${e}`;
@@ -1380,6 +1533,7 @@ async function refreshStatus(){
 
 function setFormFromCfg(c){
   document.getElementById('v4l2Dev').value = c.v4l2Dev||'/dev/video0';
+  document.getElementById('v4l2Sources').value = (Array.isArray(c.v4l2Sources) && c.v4l2Sources.length) ? c.v4l2Sources.join(',') : '';
   document.getElementById('edidPath').value = c.edidPath||'';
   document.getElementById('present').value = c.present||'fit';
   document.getElementById('viewport').value = c.viewport||'';
@@ -1391,16 +1545,20 @@ function setFormFromCfg(c){
 }
 
 function cfgFromForm(){
-  // Before sending payload, hard-normalize layers to avoid backend apply failures.
+  // Normalize layers before sending to avoid backend apply failures.
   cfg.layers = (cfg.layers||[]).map(L => ensureLayerDefaults(L));
-  // Coerce filter param types to match schema (prevents backend 400s like sobel.invert bool)
+
+  // Coerce filter param types
   (cfg.layers||[]).forEach(L => {
     if (L.type !== 'video') return;
     if (!Array.isArray(L.filters)) return;
     L.filters.forEach(f => coerceFilterParamsInPlace(f));
   });
+
+  const v4l2Sources = parseCSVStrings(document.getElementById('v4l2Sources').value);
   return {
     v4l2Dev: document.getElementById('v4l2Dev').value,
+    v4l2Sources, // NEW
     edidPath: document.getElementById('edidPath').value,
     present: document.getElementById('present').value,
     viewport: document.getElementById('viewport').value,
@@ -1440,6 +1598,7 @@ function hookGlobalUI(){
     setMode('select');
     await loadAll();
   };
+
   document.getElementById('btnApply').onclick = async () => {
     const errs = validateCfg();
     if (errs.length) {
@@ -1459,12 +1618,107 @@ function hookGlobalUI(){
     }
     await refreshStatus();
   };
+
   document.getElementById('btnQuit').onclick = async () => {
     await api('/api/quit', {method:'POST'});
   };
+
+  // Add Video (append new layer, don't overwrite)
+  document.getElementById('btnAddVideo').onclick = () => {
+    if (!cfg) return;
+    if (!Array.isArray(cfg.layers)) cfg.layers = [];
+    const L = makeDefaultVideoLayer();
+    cfg.layers.push(L);
+    selectedIdx = cfg.layers.length - 1;
+    setMode('select');
+    validateCfg();
+    renderAll();
+  };
 }
 
-function hookInspector(){ /* unchanged for this bug */ }
+function hookInspector(){
+  // Wire up base inspector controls + per-layer fields.
+  const byId = (id) => document.getElementById(id);
+
+  const iName = byId('iName');
+  const iEnabled = byId('iEnabled');
+  const iOpacity = byId('iOpacity');
+  const iInvertRel = byId('iInvertRel');
+  const btnDupLayer = byId('btnDupLayer');
+
+  const iSrcRect = byId('iSrcRect');
+  const iDstPos = byId('iDstPos');
+  const iScale = byId('iScale');
+  const btnClampSrc = byId('btnClampSrc');
+
+  function curLayer(){
+    if (!cfg) return null;
+    if (selectedIdx < 0 || selectedIdx >= cfg.layers.length) return null;
+    return cfg.layers[selectedIdx];
+  }
+
+  iName.onchange = () => {
+    const L = curLayer(); if (!L) return;
+    L.name = iName.value;
+    validateCfg(); renderLayersTable(); renderStage(); renderInspector();
+  };
+  iEnabled.onchange = () => {
+    const L = curLayer(); if (!L) return;
+    L.enabled = !!iEnabled.checked;
+    validateCfg(); renderLayersTable(); renderStage(); renderInspector();
+  };
+  iOpacity.onchange = () => {
+    const L = curLayer(); if (!L) return;
+    L.opacity = clamp(Number(iOpacity.value), 0, 1);
+    validateCfg(); renderLayersTable(); renderStage(); renderInspector();
+  };
+  iInvertRel.onchange = () => {
+    const L = curLayer(); if (!L) return;
+    L.invertRel = iInvertRel.value;
+    validateCfg(); renderLayersTable(); renderStage(); renderInspector();
+  };
+  btnDupLayer.onclick = () => {
+    const L = curLayer(); if (!L) return;
+    const copy = deepClone(L);
+    copy.name = (copy.name||'Layer') + "_copy";
+    cfg.layers.splice(selectedIdx+1, 0, copy);
+    selectedIdx = selectedIdx+1;
+    validateCfg(); renderAll();
+  };
+
+  // Video inspector fields
+  iSrcRect.onchange = () => {
+    const L = curLayer(); if (!L || L.type !== 'video') return;
+    if (!parseRect(iSrcRect.value)) return;
+    L.srcRect = iSrcRect.value;
+    validateCfg(); renderStage();
+  };
+  iDstPos.onchange = () => {
+    const L = curLayer(); if (!L || L.type !== 'video') return;
+    if (!parsePos(iDstPos.value)) return;
+    L.dstPos = iDstPos.value;
+    validateCfg(); renderStage();
+  };
+  iScale.onchange = () => {
+    const L = curLayer(); if (!L || L.type !== 'video') return;
+    if (!parseScale(iScale.value)) return;
+    L.scale = iScale.value;
+    validateCfg(); renderStage();
+  };
+  btnClampSrc.onclick = () => {
+    const L = curLayer(); if (!L || L.type !== 'video') return;
+    clampLayerSrcRectToCaptureProxy(L);
+    validateCfg(); renderInspector(); renderStage();
+  };
+
+  // Global fields that affect vp help
+  document.getElementById('viewport').oninput = () => {
+    if (!cfg) return;
+    cfg.viewport = document.getElementById('viewport').value;
+    renderVPHelp();
+    renderStage();
+  };
+}
 
 function hookImageNaturalSize(){
   const img = document.getElementById('refImg');
@@ -1484,6 +1738,7 @@ function renderAll(){
 }
 
 setInterval(refreshStatus, 1000);
+
 (async () => {
   hookGlobalUI();
   hookInspector();
@@ -1494,17 +1749,16 @@ setInterval(refreshStatus, 1000);
   await refreshStatus();
 })();
 </script>
+
 </body>
 </html>)HTML";
 
 void webui_start_detached(int port) {
   std::thread([port]() {
     httplib::Server svr;
-
     svr.Get("/", [](const httplib::Request&, httplib::Response &res) {
       res.set_content(kIndexHtml, "text/html; charset=utf-8");
     });
-
     svr.Get("/ref.png", [](const httplib::Request&, httplib::Response &res) {
       std::vector<uint8_t> png;
       {
@@ -1518,7 +1772,6 @@ void webui_start_detached(int port) {
       }
       res.set_content(reinterpret_cast<const char*>(png.data()), png.size(), "image/png");
     });
-
     svr.Get("/api/config", [](const httplib::Request&, httplib::Response &res) {
       std::string (*cfgp)() = nullptr;
       {
@@ -1532,7 +1785,6 @@ void webui_start_detached(int port) {
       }
       res.set_content(cfgp(), "application/json");
     });
-
     svr.Get("/api/status", [](const httplib::Request&, httplib::Response &res) {
       std::string (*st)() = nullptr;
       {
@@ -1546,7 +1798,6 @@ void webui_start_detached(int port) {
       }
       res.set_content(st(), "application/json");
     });
-
     // Optional dynamic filter enumeration
     svr.Get("/api/filters", [](const httplib::Request&, httplib::Response &res) {
       std::string (*fp)() = nullptr;
@@ -1562,7 +1813,6 @@ void webui_start_detached(int port) {
       }
       res.set_content(fp(), "application/json");
     });
-
     svr.Post("/api/apply", [](const httplib::Request &req, httplib::Response &res) {
       bool (*apply)(const std::string&, std::string&, int&) = nullptr;
       {
@@ -1580,7 +1830,6 @@ void webui_start_detached(int port) {
       res.status = st;
       res.set_content(out, "application/json");
     });
-
     svr.Post("/api/quit", [](const httplib::Request&, httplib::Response &res) {
       std::atomic<bool> *q = nullptr;
       {
@@ -1590,7 +1839,6 @@ void webui_start_detached(int port) {
       if (q) q->store(true);
       res.set_content("{\"ok\":true}", "application/json");
     });
-
     std::string addr;
     {
       std::lock_guard<std::mutex> lk(g_mtx);

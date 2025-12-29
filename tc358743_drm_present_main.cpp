@@ -945,6 +945,8 @@ struct source_capture {
   source_probe last_probe{};
   std::mutex probe_mtx;
 
+  // Prefer UYVY/YUYV for TC358743 if supported, fallback to RGB24.
+  // This avoids forcing RGB24 (3 bytes/pixel) which can be more expensive for some devices/drivers.
   bool init_tc358743(const persisted_config &cfg, const std::string &dev_path) {
     is_tc358743 = true;
     dev = dev_path;
@@ -961,8 +963,21 @@ struct source_capture {
       fprintf(stderr, "[source] %s: no DV timings (no signal?)\n", dev.c_str());
       return false;
     }
-    if (tc358743_set_pixfmt_rgb24(vfd, &in_w, &in_h, &in_stride) != 0) return false;
-    in_pixfmt = V4L2_PIX_FMT_RGB24;
+
+    // ---- OPTIMIZATION CHANGE: prefer 4:2:2 formats ----
+    // Try UYVY then YUYV, then fallback to RGB24.
+    if (v4l2_set_fmt_capture(vfd, V4L2_PIX_FMT_UYVY, 0, 0, &in_w, &in_h, &in_stride) == 0) {
+      in_pixfmt = V4L2_PIX_FMT_UYVY;
+      fprintf(stderr, "[source] %s: using UYVY %ux%u stride=%u\n", dev.c_str(), in_w, in_h, in_stride);
+    } else if (v4l2_set_fmt_capture(vfd, V4L2_PIX_FMT_YUYV, 0, 0, &in_w, &in_h, &in_stride) == 0) {
+      in_pixfmt = V4L2_PIX_FMT_YUYV;
+      fprintf(stderr, "[source] %s: using YUYV %ux%u stride=%u\n", dev.c_str(), in_w, in_h, in_stride);
+    } else {
+      if (tc358743_set_pixfmt_rgb24(vfd, &in_w, &in_h, &in_stride) != 0) return false;
+      in_pixfmt = V4L2_PIX_FMT_RGB24;
+      fprintf(stderr, "[source] %s: using RGB24 %ux%u stride=%u\n", dev.c_str(), in_w, in_h, in_stride);
+    }
+
     if (v4l2_start_mmap_capture(vfd, &cbufs, &cbuf_count) != 0) return false;
     have_held_buf=false;
     memset(&held_buf, 0, sizeof(held_buf));
@@ -1900,9 +1915,6 @@ static std::string status_json() {
 static std::string config_json_provider() { return config_to_json(cfg_snapshot()); }
 
 // ---- V4L2 caps provider wiring for /api/v4l2/caps?dev=... ----
-// IMPORTANT: This assumes your tc358743_webui.h provider signature is:
-//   using v4l2_caps_provider_fn = std::string (*)(const std::string& dev);
-// If your actual signature differs, paste tc358743_webui.h and I’ll adjust.
 static std::string json_error_caps(const std::string &dev, const std::string &msg, int err_no, int http_status) {
   json j;
   j["ok"] = false;
@@ -1976,7 +1988,6 @@ static bool apply_from_body(const std::string &body, std::string &out_json, int 
   get_str("preferOutputRes", s);
   if (!s.empty()) {
     uint32_t w=0,h=0;
-    // reuse overlay_backend parsing by roundtrip isn't worth; accept WxH only
     if (sscanf(s.c_str(), "%ux%u", &w, &h) != 2 || !w || !h) {
       set_last_apply(false,"invalid preferOutputRes"); out_http_status=400; out_json="{\"error\":\"invalid preferOutputRes\"}"; return false;
     }
@@ -2032,9 +2043,7 @@ static bool apply_from_body(const std::string &body, std::string &out_json, int 
   }
 
   // Layers: easiest safe path is to roundtrip through overlay_backend JSON parser by building a temp json string.
-  // But to avoid rewriting all validation here, we accept layers as-is and let config_from_json_text handle on load.
   if (j.contains("layers") && j["layers"].is_array()) {
-    // serialize only layers and reparse using overlay_backend via config_from_json_text:
     json tmp;
     tmp["layers"] = j["layers"];
     tmp["v4l2Dev"] = next.v4l2_dev;
@@ -2302,25 +2311,25 @@ int main(int argc, char **argv) {
     usleep(1000*1000);
   }
 
-// Capture reference PNG once at startup for WebUI preview (/ref.png)
-std::vector<uint8_t> ref_png;
-{
-  persisted_config snap = cfg_snapshot();
+  // Capture reference PNG once at startup for WebUI preview (/ref.png)
+  std::vector<uint8_t> ref_png;
+  {
+    persisted_config snap = cfg_snapshot();
 
-  // Choose the first active source (pipeline already initialized)
-  if (!p.sources.empty() && p.sources[0]) {
-    std::vector<uint32_t> xrgb;
-    uint32_t w=0,h=0,stride_bytes=0;
-    if (grab_one_frame_xrgb_from_source(snap, *p.sources[0], xrgb, w, h, stride_bytes)) {
-      ref_png = xrgb8888_to_png_uncompressed(xrgb.data(), w, h, stride_bytes);
-      fprintf(stderr, "[webui] reference PNG captured: %zu bytes (%ux%u)\n", ref_png.size(), w, h);
+    // Choose the first active source (pipeline already initialized)
+    if (!p.sources.empty() && p.sources[0]) {
+      std::vector<uint32_t> xrgb;
+      uint32_t w=0,h=0,stride_bytes=0;
+      if (grab_one_frame_xrgb_from_source(snap, *p.sources[0], xrgb, w, h, stride_bytes)) {
+        ref_png = xrgb8888_to_png_uncompressed(xrgb.data(), w, h, stride_bytes);
+        fprintf(stderr, "[webui] reference PNG captured: %zu bytes (%ux%u)\n", ref_png.size(), w, h);
+      } else {
+        fprintf(stderr, "[webui] reference PNG capture failed\n");
+      }
     } else {
-      fprintf(stderr, "[webui] reference PNG capture failed\n");
+      fprintf(stderr, "[webui] reference PNG capture skipped (no sources)\n");
     }
-  } else {
-    fprintf(stderr, "[webui] reference PNG capture skipped (no sources)\n");
   }
-}
 
   // WEBUI STARTUP
   if (webui_enabled) {

@@ -69,8 +69,8 @@ void cfg_normalize(persisted_config &c) {
   std::vector<std::string> tc;
   for (auto &s : c.tc358743_order) uniq_push(tc, s);
   if (tc.size() < 2) {
-    uniq_push(tc, "/dev/video0");
-    uniq_push(tc, "/dev/video1");
+    uniq_push(tc, "/dev/v4l/by-path/platform-fe800000.csi-video-index0");
+    uniq_push(tc, "/dev/v4l/by-path/platform-fe801000.csi-video-index0");
   }
   if (tc.size() > 2) tc.resize(2);
   c.tc358743_order = tc;

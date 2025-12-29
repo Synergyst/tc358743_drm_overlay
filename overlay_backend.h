@@ -66,10 +66,10 @@ struct aux_source_cfg {
 
 struct persisted_config {
   // Default layer source
-  std::string v4l2_dev="/dev/video0";
+  std::string v4l2_dev="/dev/v4l/by-path/platform-fe800000.csi-video-index0";
 
   // Hard-coded TC358743 pair but reorderable
-  std::vector<std::string> tc358743_order{"/dev/video0","/dev/video1"};
+  std::vector<std::string> tc358743_order{"/dev/v4l/by-path/platform-fe800000.csi-video-index0","/dev/v4l/by-path/platform-fe801000.csi-video-index0"};
 
   // Aux sources (generic V4L2)
   std::vector<aux_source_cfg> aux_sources{};

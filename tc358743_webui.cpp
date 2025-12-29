@@ -298,12 +298,12 @@ static const char *kIndexHtml = R"HTML(<!doctype html>
         <div class="grid2">
           <div>
             <label>V4L2 Device</label>
-            <input id="v4l2Dev" type="text" placeholder="/dev/video0"/>
+            <input id="v4l2Dev" type="text" placeholder="/dev/v4l/by-path/platform-fe800000.csi-video-index0"/>
             <div class="help">Default source used by new video layers (unless layer overrides videoSource).</div>
           </div>
           <div>
             <label>V4L2 Sources (CSV)</label>
-            <input id="v4l2Sources" class="mono" type="text" placeholder="/dev/video0,/dev/video1"/>
+            <input id="v4l2Sources" class="mono" type="text" placeholder="/dev/v4l/by-path/platform-fe800000.csi-video-index0,/dev/v4l/by-path/platform-fe801000.csi-video-index0"/>
             <div class="help">Optional list of sources; used for per-layer selection and status display.</div>
           </div>
           <div>
@@ -1270,8 +1270,8 @@ function getKnownSources(){
   if (cfg && Array.isArray(cfg.v4l2Sources)) cfg.v4l2Sources.forEach(add);
   const rtSources = runtime && runtime.runtime && Array.isArray(runtime.runtime.sources) ? runtime.runtime.sources : [];
   rtSources.forEach(x => add(x.dev));
-  add("/dev/video0");
-  add("/dev/video1");
+  add("/dev/v4l/by-path/platform-fe800000.csi-video-index0");
+  add("/dev/v4l/by-path/platform-fe801000.csi-video-index0");
   return arr;
 }
 function getActiveSourcesFromRuntime(){
@@ -1424,7 +1424,7 @@ async function refreshStatus(){
   }
 }
 function setFormFromCfg(c){
-  document.getElementById('v4l2Dev').value = c.v4l2Dev||'/dev/video0';
+  document.getElementById('v4l2Dev').value = c.v4l2Dev||'/dev/v4l/by-path/platform-fe800000.csi-video-index0';
   document.getElementById('v4l2Sources').value = (Array.isArray(c.v4l2Sources) && c.v4l2Sources.length) ? c.v4l2Sources.join(',') : '';
   document.getElementById('edidPath').value = c.edidPath||'';
   document.getElementById('present').value = c.present||'fit';

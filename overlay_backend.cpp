@@ -168,6 +168,13 @@ json filter_registry_json() {
     };
     filters.push_back(f);
   }
+  {
+    json f;
+    f["id"] = "m3liteEdgeMask";
+    f["name"] = "M3Lite edge mask (combined)";
+    f["params"] = json::object(); // no params for now
+    filters.push_back(f);
+  }
   j["filters"] = filters;
   return j;
 }
@@ -259,6 +266,9 @@ std::string config_to_json(const persisted_config &c_in) {
             {"setRgb", F.set_rgb},
             {"outRgb", std::to_string((int)F.out_r) + "," + std::to_string((int)F.out_g) + "," + std::to_string((int)F.out_b)}
           };
+        } else if (F.id == FILTER_M3LITE_EDGE_MASK) {
+          jf["id"] = "m3liteEdgeMask";
+          jf["params"] = json::object();
         } else {
           jf["id"] = "unknown";
           jf["params"] = json::object();
@@ -517,6 +527,9 @@ bool config_from_json_text(const std::string &text, persisted_config &c) {
                 fc.out_r = rr; fc.out_g = gg; fc.out_b = bb;
               }
             }
+          } else if (id == "m3liteEdgeMask") {
+            fc.id = FILTER_M3LITE_EDGE_MASK;
+            // no params
           } else {
             continue;
           }

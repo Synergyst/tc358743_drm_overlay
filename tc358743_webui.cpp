@@ -658,6 +658,11 @@ const FILTER_FALLBACK = {
         { k:"setRgb", type:"bool", default:false },
         { k:"outRgb", type:"string", default:"255,255,255" }
       ]
+    },
+    {
+      id: "m3liteEdgeMask",
+      name: "M3Lite edge mask (combined)",
+      params: []
     }
   ]
 };
@@ -667,6 +672,7 @@ function schemaForKnownFilterId(id){
   if (id === 'denoise') return FILTER_FALLBACK.filters[2].params;
   if (id === 'rgbMap') return FILTER_FALLBACK.filters[3].params;
   if (id === 'rgbKeyAlpha') return FILTER_FALLBACK.filters[4].params;
+  if (id === 'm3liteEdgeMask') return FILTER_FALLBACK.filters[5].params;
   return [];
 }
 function normalizeFilterDef(def){

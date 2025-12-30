@@ -1543,7 +1543,7 @@ static inline bool is_key_white(uint8_t r, uint8_t g, uint8_t b, int th) {
   return (r >= lo) && (g >= lo) && (b >= lo);
 }
 
-static void filter_apply_rgb_key_alpha(layer_buf &buf,
+/*static void filter_apply_rgb_key_alpha(layer_buf &buf,
                                        filter_cfg::key_mode_t mode,
                                        int threshold,
                                        uint8_t keyA,
@@ -1570,6 +1570,230 @@ static void filter_apply_rgb_key_alpha(layer_buf &buf,
     }
     buf.px[i] = ((uint32_t)a << 24) | ((uint32_t)r << 16) | ((uint32_t)g << 8) | (uint32_t)b;
   }
+}*/
+static void filter_apply_rgb_key_alpha(layer_buf &buf,
+                                       filter_cfg::key_mode_t mode,
+                                       int threshold,
+                                       uint8_t keyA,
+                                       uint8_t keepA,
+                                       bool setRgb,
+                                       uint8_t outR, uint8_t outG, uint8_t outB) {
+  if (buf.w == 0 || buf.h == 0) return;
+  if (buf.px.empty()) return;
+
+  threshold = std::max(0, std::min(threshold, 255));
+  const uint8_t lo = (uint8_t)threshold;
+  const uint8_t hi = (uint8_t)(255 - threshold);
+
+#if defined(__ARM_NEON) || defined(__ARM_NEON__)
+  const uint32x4_t out_rgb = vdupq_n_u32(0xFF000000u | ((uint32_t)outR << 16) | ((uint32_t)outG << 8) | (uint32_t)outB);
+
+  const uint32x4_t vlo = vdupq_n_u32((uint32_t)lo);
+  const uint32x4_t vhi = vdupq_n_u32((uint32_t)hi);
+
+  // Helper: extract channel as 0..255 in u32 lanes
+  auto ch_u32 = [&](uint32x4_t p, int shift) -> uint32x4_t {
+    if (shift == 0) return vandq_u32(p, vdupq_n_u32(0xFFu));
+    return vandq_u32(vshrq_n_u32(p, shift), vdupq_n_u32(0xFFu));
+  };
+
+  // Compute keyed mask for a 4-lane vector:
+  // KEY_BLACK: (r<=lo && g<=lo && b<=lo)
+  // KEY_WHITE: (r>=hi && g>=hi && b>=hi)
+  auto keyed_mask_u32 = [&](uint32x4_t p) -> uint32x4_t {
+    uint32x4_t r = ch_u32(p, 16);
+    uint32x4_t g = ch_u32(p, 8);
+    uint32x4_t b = ch_u32(p, 0);
+
+    if (mode == filter_cfg::KEY_WHITE) {
+      uint32x4_t mr = vcgeq_u32(r, vhi);
+      uint32x4_t mg = vcgeq_u32(g, vhi);
+      uint32x4_t mb = vcgeq_u32(b, vhi);
+      return vandq_u32(vandq_u32(mr, mg), mb);
+    } else {
+      uint32x4_t mr = vcleq_u32(r, vlo);
+      uint32x4_t mg = vcleq_u32(g, vlo);
+      uint32x4_t mb = vcleq_u32(b, vlo);
+      return vandq_u32(vandq_u32(mr, mg), mb);
+    }
+  };
+
+  // Alpha top byte vectors
+  const uint32x4_t vKeyA  = vdupq_n_u32((uint32_t)keyA  << 24);
+  const uint32x4_t vKeepA = vdupq_n_u32((uint32_t)keepA << 24);
+
+  size_t i = 0;
+  const size_t n = buf.px.size();
+
+  for (; i + 16 <= n; i += 16) {
+    uint32_t *src = &buf.px[i];
+
+    uint32x4_t p0 = vld1q_u32(src + 0);
+    uint32x4_t p1 = vld1q_u32(src + 4);
+    uint32x4_t p2 = vld1q_u32(src + 8);
+    uint32x4_t p3 = vld1q_u32(src + 12);
+
+    // keyed masks (0xFFFFFFFF per lane if keyed)
+    uint32x4_t k0 = keyed_mask_u32(p0);
+    uint32x4_t k1 = keyed_mask_u32(p1);
+    uint32x4_t k2 = keyed_mask_u32(p2);
+    uint32x4_t k3 = keyed_mask_u32(p3);
+
+    // alpha = keyed ? keyA : keepA  (in top byte)
+    uint32x4_t a0 = vbslq_u32(k0, vKeyA, vKeepA);
+    uint32x4_t a1 = vbslq_u32(k1, vKeyA, vKeepA);
+    uint32x4_t a2 = vbslq_u32(k2, vKeyA, vKeepA);
+    uint32x4_t a3 = vbslq_u32(k3, vKeyA, vKeepA);
+
+    if (setRgb) {
+      // force RGB to constant, keep computed alpha
+      uint32x4_t rgb0 = vandq_u32(out_rgb, vdupq_n_u32(0x00FFFFFFu));
+      p0 = vorrq_u32(a0, rgb0);
+      p1 = vorrq_u32(a1, rgb0);
+      p2 = vorrq_u32(a2, rgb0);
+      p3 = vorrq_u32(a3, rgb0);
+    } else {
+      // keep existing RGB, overwrite alpha
+      uint32x4_t rgb0 = vandq_u32(p0, vdupq_n_u32(0x00FFFFFFu));
+      uint32x4_t rgb1 = vandq_u32(p1, vdupq_n_u32(0x00FFFFFFu));
+      uint32x4_t rgb2 = vandq_u32(p2, vdupq_n_u32(0x00FFFFFFu));
+      uint32x4_t rgb3 = vandq_u32(p3, vdupq_n_u32(0x00FFFFFFu));
+      p0 = vorrq_u32(a0, rgb0);
+      p1 = vorrq_u32(a1, rgb1);
+      p2 = vorrq_u32(a2, rgb2);
+      p3 = vorrq_u32(a3, rgb3);
+    }
+
+    vst1q_u32(src + 0,  p0);
+    vst1q_u32(src + 4,  p1);
+    vst1q_u32(src + 8,  p2);
+    vst1q_u32(src + 12, p3);
+  }
+
+  // scalar tail
+  for (; i < n; i++) {
+    uint32_t p = buf.px[i];
+    uint8_t r = (uint8_t)((p >> 16) & 0xFF);
+    uint8_t g = (uint8_t)((p >> 8) & 0xFF);
+    uint8_t b = (uint8_t)(p & 0xFF);
+
+    bool keyed = false;
+    if (mode == filter_cfg::KEY_WHITE) {
+      keyed = (r >= hi) && (g >= hi) && (b >= hi);
+    } else {
+      keyed = (r <= lo) && (g <= lo) && (b <= lo);
+    }
+
+    uint8_t a = keyed ? keyA : keepA;
+    if (setRgb) {
+      buf.px[i] = ((uint32_t)a << 24) | ((uint32_t)outR << 16) | ((uint32_t)outG << 8) | (uint32_t)outB;
+    } else {
+      buf.px[i] = ((uint32_t)a << 24) | (p & 0x00FFFFFFu);
+    }
+  }
+
+#else
+  // scalar fallback
+  for (size_t i=0; i<buf.px.size(); i++) {
+    uint32_t p = buf.px[i];
+    uint8_t r = (uint8_t)((p >> 16) & 0xFF);
+    uint8_t g = (uint8_t)((p >> 8) & 0xFF);
+    uint8_t b = (uint8_t)(p & 0xFF);
+
+    bool keyed = false;
+    if (mode == filter_cfg::KEY_WHITE) {
+      keyed = (r >= hi) && (g >= hi) && (b >= hi);
+    } else {
+      keyed = (r <= lo) && (g <= lo) && (b <= lo);
+    }
+
+    uint8_t a = keyed ? keyA : keepA;
+    if (setRgb) buf.px[i] = ((uint32_t)a<<24) | ((uint32_t)outR<<16) | ((uint32_t)outG<<8) | (uint32_t)outB;
+    else buf.px[i] = ((uint32_t)a<<24) | (p & 0x00FFFFFFu);
+  }
+#endif
+}
+static inline uint8_t luma_u8_from_xrgb_scalar(uint32_t p) {
+  uint32_t r=(p>>16)&0xFF, g=(p>>8)&0xFF, b=p&0xFF;
+  return (uint8_t)((r*77 + g*150 + b*29 + 128) >> 8);
+}
+static void filter_apply_m3lite_edge_mask(layer_buf &buf) {
+  // Hardcoded “M3Lite edge mask”:
+  // 1) Sobel magnitude
+  // 2) Sobel edgesOnly (run on the magnitude output; matches “double-sobel” chaining semantics)
+  // 3) Thicken edges (cheap dilation on luma)
+  // 4) Colorize to green with alpha (black -> alpha 0)
+
+  if (buf.w < 3 || buf.h < 3 || buf.px.empty()) {
+    std::fill(buf.px.begin(), buf.px.end(), 0x00000000u);
+    return;
+  }
+
+  // ---- hardcoded knobs (tweak as needed) ----
+  const uint8_t sobel1_threshold = 1;     // magnitude pass threshold unused in magnitude mode
+  const uint8_t sobel2_threshold = 1;     // edgesOnly threshold
+  const float   sobel2_alpha     = 1.0f;  // edgesOnly alpha
+  const bool    sobel_invert     = false;
+
+  const uint8_t edge_on_threshold = 42;   // after double-sobel, consider this “edge present”
+  const int     thicken_radius = 1;       // 1 => 3x3 dilation (thicker lines)
+  const uint8_t out_a = 64;               // alpha for green lines
+  // ------------------------------------------
+
+  // 1) Sobel magnitude (writes opaque grayscale into buf) [4]
+  filter_apply_sobel(buf, filter_cfg::SOBEL_MAGNITUDE, sobel1_threshold, 1.0f, sobel_invert);
+
+  // 2) Sobel edgesOnly on result (writes A=alpha, RGB=mag where >=threshold, else 0) [4]
+  filter_apply_sobel(buf, filter_cfg::SOBEL_EDGES_ONLY, sobel2_threshold, sobel2_alpha, sobel_invert);
+
+  // 3) Build a binary-ish edge mask from current buffer’s luma (use R since it’s grayscale in Sobel output)
+  const uint32_t w = buf.w, h = buf.h;
+  std::vector<uint8_t> m((size_t)w * (size_t)h, 0);
+
+  for (size_t i=0; i<buf.px.size(); i++) {
+    uint32_t p = buf.px[i];
+    uint8_t a = (uint8_t)((p >> 24) & 0xFF);
+    uint8_t y = (uint8_t)((p >> 16) & 0xFF); // Sobel output is grayscale, so R==G==B [4]
+    // Treat any transparent pixel as not-an-edge, regardless of RGB.
+    m[i] = (a != 0 && y >= edge_on_threshold) ? 255 : 0;
+  }
+
+  // 4) Thicken lines via dilation on the mask (radius 1 is a 3x3 max filter)
+  if (thicken_radius > 0) {
+    std::vector<uint8_t> md = m;
+    const int r = thicken_radius;
+    for (uint32_t y=1; y+1<h; y++) {
+      for (uint32_t x=1; x+1<w; x++) {
+        uint8_t mx = 0;
+        // Small radius only; keep it cheap.
+        for (int dy=-r; dy<=r; dy++) {
+          int yy = (int)y + dy;
+          if (yy < 0) continue;
+          if (yy >= (int)h) continue;
+          const uint8_t *row = &m[(size_t)yy * (size_t)w];
+          for (int dx=-r; dx<=r; dx++) {
+            int xx = (int)x + dx;
+            if (xx < 0) continue;
+            if (xx >= (int)w) continue;
+            uint8_t v = row[xx];
+            if (v > mx) mx = v;
+          }
+        }
+        md[(size_t)y*(size_t)w + (size_t)x] = mx;
+      }
+    }
+    m.swap(md);
+  }
+
+  // 5) Write final output: green where mask is on, else transparent.
+  // Use per-pixel alpha (filtered compositor respects it) [4]
+  for (size_t i=0; i<buf.px.size(); i++) {
+    if (m[i]) {
+      buf.px[i] = ((uint32_t)out_a << 24) | 0x0000FF00u; // A + green
+    } else {
+      buf.px[i] = 0x00000000u; // fully transparent
+    }
+  }
 }
 static void apply_filter_chain(layer_buf &buf, const std::vector<filter_cfg> &filters) {
   for (const auto &f : filters) {
@@ -1587,6 +1811,8 @@ static void apply_filter_chain(layer_buf &buf, const std::vector<filter_cfg> &fi
                            f.a_min, f.a_max, f.a_out);
     } else if (f.id == FILTER_RGB_KEY_ALPHA) {
       filter_apply_rgb_key_alpha(buf, f.key_mode, f.key_threshold, f.key_alpha, f.keep_alpha, f.set_rgb, f.out_r, f.out_g, f.out_b);
+    } else if (f.id == FILTER_M3LITE_EDGE_MASK) {
+      filter_apply_m3lite_edge_mask(buf);
     }
   }
 }

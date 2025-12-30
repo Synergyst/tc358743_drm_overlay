@@ -503,8 +503,8 @@ static const char *kIndexHtml = R"HTML(<!doctype html>
               </div>
             </div>
             <div class="help" style="margin-top:8px;">
-              Crosshair preview is shown in the viewport. If backend rendering still doesn’t show it on HDMI output,
-              that’s backend-side, not UI.
+              Crosshair preview is shown in the viewport. If backend rendering still doesn't show it on HDMI output,
+              that's backend-side, not UI.
             </div>
           </div>
         </div>
@@ -800,6 +800,44 @@ function vpToStageX(v){ return v * (stage.stageW / stage.vpw); }
 function vpToStageY(v){ return v * (stage.stageH / stage.vph); }
 function stageToVpX(px){ return px * (stage.vpw / stage.stageW); }
 function stageToVpY(px){ return px * (stage.vph / stage.stageH); }
+
+/* ---------------- Crop helpers (added) ---------------- */
+function rectIntersect(a,b){
+  const x0 = Math.max(a.x, b.x);
+  const y0 = Math.max(a.y, b.y);
+  const x1 = Math.min(a.x + a.w, b.x + b.w);
+  const y1 = Math.min(a.y + a.h, b.y + b.h);
+  const w = Math.max(0, x1 - x0);
+  const h = Math.max(0, y1 - y0);
+  return {x:x0, y:y0, w, h};
+}
+function rectEmpty(r){ return !r || r.w <= 0 || r.h <= 0; }
+function fmtRect(r){ return `${round(r.x)},${round(r.y)},${round(r.w)},${round(r.h)}`; }
+
+// Convert a crop rectangle expressed in *viewport coords within the layer box*
+// into a srcRect in *source pixel coords*.
+function cropVPRectToSrcRect(L, cropInLayerVP){
+  const sr = parseRect(L.srcRect);
+  const sc = parseScale(L.scale);
+  if (!sr || !sc) return null;
+
+  // layer box size in VP is sr.w*sc.sx, sr.h*sc.sy
+  // so src pixels = vp / scale
+  const x = sr.x + (cropInLayerVP.x / sc.sx);
+  const y = sr.y + (cropInLayerVP.y / sc.sy);
+  const w = (cropInLayerVP.w / sc.sx);
+  const h = (cropInLayerVP.h / sc.sy);
+
+  // clamp + round
+  const xi = Math.max(0, Math.floor(x + 0.5));
+  const yi = Math.max(0, Math.floor(y + 0.5));
+  const wi = Math.max(1, Math.floor(w + 0.5));
+  const hi = Math.max(1, Math.floor(h + 0.5));
+  return {x:xi, y:yi, w:wi, h:hi};
+}
+
+/* ---------------------------------------------------- */
+
 function computeLayerBoxVP(L){
   const dp = parsePos(L.dstPos) || {x:0,y:0};
   const sr = parseRect(L.srcRect) || {x:0,y:0,w:1,h:1};
@@ -965,16 +1003,177 @@ function stopStageDrag(){
   renderInspector();
   renderCrosshairPreview();
 }
+
+/* ---------------- Crop commit logic (added) ---------------- */
+function doCropKeep(layerIdx, cropSrcRect){
+  const L = cfg.layers[layerIdx];
+  if (!L || L.type !== 'video') return;
+
+  // Keep visual placement: move dstPos by crop offset in output-space
+  const dp = parsePos(L.dstPos) || {x:0,y:0};
+  const sc = parseScale(L.scale) || {sx:1,sy:1};
+  const srOld = parseRect(L.srcRect);
+  if (!srOld) return;
+
+  const dxSrc = cropSrcRect.x - srOld.x;
+  const dySrc = cropSrcRect.y - srOld.y;
+
+  dp.x += dxSrc * sc.sx;
+  dp.y += dySrc * sc.sy;
+
+  L.dstPos = `${round(dp.x)},${round(dp.y)}`;
+  L.srcRect = fmtRect(cropSrcRect);
+}
+
+function doCropRemoveSplit(layerIdx, cropSrcRect){
+  const L = cfg.layers[layerIdx];
+  if (!L || L.type !== 'video') return;
+
+  const sr = parseRect(L.srcRect);
+  const dp = parsePos(L.dstPos) || {x:0,y:0};
+  const sc = parseScale(L.scale) || {sx:1,sy:1};
+  if (!sr || !sc) return;
+
+  // Clamp crop rect to sr
+  const crop = rectIntersect(sr, cropSrcRect);
+  if (rectEmpty(crop)) return;
+
+  // Remaining regions in source coords (up to 4)
+  const regions = [];
+
+  // Top band
+  if (crop.y > sr.y) {
+    regions.push({x: sr.x, y: sr.y, w: sr.w, h: crop.y - sr.y});
+  }
+  // Bottom band
+  const cropBottom = crop.y + crop.h;
+  const srBottom = sr.y + sr.h;
+  if (cropBottom < srBottom) {
+    regions.push({x: sr.x, y: cropBottom, w: sr.w, h: srBottom - cropBottom});
+  }
+  // Middle left
+  if (crop.x > sr.x) {
+    regions.push({x: sr.x, y: crop.y, w: crop.x - sr.x, h: crop.h});
+  }
+  // Middle right
+  const cropRight = crop.x + crop.w;
+  const srRight = sr.x + sr.w;
+  if (cropRight < srRight) {
+    regions.push({x: cropRight, y: crop.y, w: srRight - cropRight, h: crop.h});
+  }
+
+  const baseName = L.name || "Layer";
+  const baseVideoSource = (L.videoSource !== undefined) ? L.videoSource : "";
+  const baseInvert = L.invertRel || "none";
+  const baseOpacity = isNum(L.opacity) ? L.opacity : 1.0;
+  const baseEnabled = (L.enabled !== undefined) ? !!L.enabled : true;
+  const baseFilters = Array.isArray(L.filters) ? deepClone(L.filters) : [];
+  const baseScale = L.scale;
+
+  const newLayers = regions
+    .filter(r => r.w > 0 && r.h > 0)
+    .map((r, i) => {
+      const dx = (r.x - sr.x) * sc.sx;
+      const dy = (r.y - sr.y) * sc.sy;
+      return ensureLayerDefaults({
+        name: `${baseName}_split${i+1}`,
+        type: "video",
+        enabled: baseEnabled,
+        opacity: baseOpacity,
+        invertRel: baseInvert,
+        srcRect: fmtRect(r),
+        dstPos: `${round(dp.x + dx)},${round(dp.y + dy)}`,
+        scale: baseScale,
+        filters: baseFilters,
+        videoSource: baseVideoSource,
+      });
+    });
+
+  if (newLayers.length === 0) {
+    L.enabled = false;
+    return;
+  }
+
+  cfg.layers.splice(layerIdx, 1, ...newLayers);
+  selectedIdx = layerIdx;
+}
+
+function hookCropPanel(){
+  const btnCancel = document.getElementById('btnCropCancel');
+  const btnCommit = document.getElementById('btnCropCommit');
+
+  btnCancel.onclick = () => {
+    setMode('select');
+    const read = document.getElementById('cropReadout');
+    if (read) read.textContent = '(none)';
+  };
+
+  btnCommit.onclick = () => {
+    if (!cfg || selectedIdx < 0 || selectedIdx >= cfg.layers.length) return;
+    const L = cfg.layers[selectedIdx];
+    if (!L || L.type !== 'video') return;
+    if (!ui.crop.rect || ui.crop.rect.w < 1 || ui.crop.rect.h < 1) {
+      alert("Draw a crop rectangle first.");
+      return;
+    }
+
+    const cropSrc = cropVPRectToSrcRect(L, ui.crop.rect);
+    if (!cropSrc) {
+      alert("Invalid crop rectangle.");
+      return;
+    }
+
+    const mode = document.getElementById('cropMode').value;
+    if (mode === 'keep') doCropKeep(selectedIdx, cropSrc);
+    else if (mode === 'removeSplit') doCropRemoveSplit(selectedIdx, cropSrc);
+
+    ui.crop.rect = null;
+    validateCfg();
+    setMode('select');
+    renderAll();
+  };
+}
+/* -------------------------------------------------------- */
+
 function hookStagePointer(){
   const stageEl = document.getElementById('overlayStage');
+
   stageEl.onpointerdown = (ev) => {
     if (!cfg) return;
+
     const idx = getLayerFromEventTarget(ev.target);
     if (idx >= 0) {
       selectedIdx = idx;
       renderLayersTable();
       renderInspector();
       renderCrosshairPreview();
+
+      // Crop mode: start drawing crop rect inside selected video layer
+      if (ui.mode === 'crop') {
+        const L = cfg.layers[selectedIdx];
+        if (!L || L.type !== 'video') return;
+
+        updateStageMetrics();
+        const p = stageClientToVP(ev);
+        const box = computeLayerBoxVP(L);
+
+        // Only start if click is inside the layer box
+        if (p.x < box.x || p.y < box.y || p.x > box.x + box.w || p.y > box.y + box.h) return;
+
+        ui.crop.active = true;
+        ui.crop.drag = {
+          startVP: {x: p.x, y: p.y},
+          curVP: {x: p.x, y: p.y},
+        };
+        ui.crop.rect = {x:0,y:0,w:0,h:0};
+
+        stageEl.setPointerCapture(ev.pointerId);
+        ev.preventDefault();
+        renderStage();
+        return;
+      }
+
+      // Normal move/resize mode
       if (startMoveOrResize(ev)) {
         stageEl.setPointerCapture(ev.pointerId);
         ev.preventDefault();
@@ -987,14 +1186,66 @@ function hookStagePointer(){
       renderCrosshairPreview();
     }
   };
+
   stageEl.onpointermove = (ev) => {
+    if (!cfg) return;
+
+    if (ui.mode === 'crop' && ui.crop.active && ui.crop.drag && selectedIdx >= 0) {
+      const L = cfg.layers[selectedIdx];
+      if (!L || L.type !== 'video') return;
+
+      const p = stageClientToVP(ev);
+      ui.crop.drag.curVP = {x:p.x, y:p.y};
+
+      const box = computeLayerBoxVP(L);
+
+      // Convert dragged endpoints into a rect in *layer-local VP coords*
+      const x0 = clamp(Math.min(ui.crop.drag.startVP.x, p.x), box.x, box.x + box.w);
+      const y0 = clamp(Math.min(ui.crop.drag.startVP.y, p.y), box.y, box.y + box.h);
+      const x1 = clamp(Math.max(ui.crop.drag.startVP.x, p.x), box.x, box.x + box.w);
+      const y1 = clamp(Math.max(ui.crop.drag.startVP.y, p.y), box.y, box.y + box.h);
+
+      ui.crop.rect = {
+        x: x0 - box.x,
+        y: y0 - box.y,
+        w: Math.max(0, x1 - x0),
+        h: Math.max(0, y1 - y0),
+      };
+
+      const sr = cropVPRectToSrcRect(L, ui.crop.rect);
+      const read = document.getElementById('cropReadout');
+      if (read) read.textContent = sr ? fmtRect(sr) : '(invalid)';
+
+      renderStage();
+      ev.preventDefault();
+      return;
+    }
+
     if (!stageDrag) return;
     ev.preventDefault();
     applyStageDrag(ev);
   };
-  stageEl.onpointerup = () => stopStageDrag();
-  stageEl.onpointercancel = () => stopStageDrag();
+
+  stageEl.onpointerup = () => {
+    if (ui.mode === 'crop') {
+      ui.crop.active = false;
+      ui.crop.drag = null;
+      renderStage();
+      return;
+    }
+    stopStageDrag();
+  };
+  stageEl.onpointercancel = () => {
+    if (ui.mode === 'crop') {
+      ui.crop.active = false;
+      ui.crop.drag = null;
+      renderStage();
+      return;
+    }
+    stopStageDrag();
+  };
 }
+
 function renderStage(){
   if (!cfg) return;
   updateStageMetrics();
@@ -1033,7 +1284,31 @@ function renderStage(){
     });
     stageEl.appendChild(el);
   });
+
+  // Crop overlay (added)
+  if (ui.mode === 'crop' && selectedIdx >= 0 && selectedIdx < cfg.layers.length) {
+    const L = cfg.layers[selectedIdx];
+    if (L && L.type === 'video' && ui.crop.rect && ui.crop.rect.w > 0 && ui.crop.rect.h > 0) {
+      const boxVP = computeLayerBoxVP(L);
+
+      const cropEl = document.createElement('div');
+      cropEl.className = 'cropRect';
+      cropEl.style.left = vpToStageX(boxVP.x + ui.crop.rect.x) + 'px';
+      cropEl.style.top  = vpToStageY(boxVP.y + ui.crop.rect.y) + 'px';
+      cropEl.style.width  = vpToStageX(ui.crop.rect.w) + 'px';
+      cropEl.style.height = vpToStageY(ui.crop.rect.h) + 'px';
+
+      const cap = document.createElement('div');
+      cap.className = 'cap';
+      const sr = cropVPRectToSrcRect(L, ui.crop.rect);
+      cap.textContent = sr ? `srcRect => ${fmtRect(sr)}` : 'invalid crop';
+      cropEl.appendChild(cap);
+
+      stageEl.appendChild(cropEl);
+    }
+  }
 }
+
 function renderCrosshairPreview(){
   if (!cfg) return;
   // (frontend preview optional; keeping stub)
@@ -1517,9 +1792,34 @@ function hookGlobalUI(){
   document.getElementById('btnAddCrosshair').onclick = () => {
     alert("Crosshair layer UI exists in inspector, but add-crosshair not wired in this webui build.");
   };
+
+  // Crop button (changed from alert to real mode toggle)
   document.getElementById('btnCrop').onclick = () => {
-    alert("Crop mode UI present; crop commit logic not implemented in this webui build.");
+    if (selectedIdx < 0 || !cfg || selectedIdx >= cfg.layers.length) {
+      alert("Select a video layer first.");
+      return;
+    }
+    const L = cfg.layers[selectedIdx];
+    if (!L || L.type !== 'video') {
+      alert("Crop is only supported for video layers.");
+      return;
+    }
+    setMode(ui.mode === 'crop' ? 'select' : 'crop');
+    const read = document.getElementById('cropReadout');
+    if (read) read.textContent = '(draw a rectangle in the selected layer)';
   };
+
+  // Keyboard shortcuts for crop mode
+  window.addEventListener('keydown', (ev) => {
+    if (ui.mode !== 'crop') return;
+    if (ev.key === 'Escape') {
+      document.getElementById('btnCropCancel').click();
+      ev.preventDefault();
+    } else if (ev.key === 'Enter') {
+      document.getElementById('btnCropCommit').click();
+      ev.preventDefault();
+    }
+  });
 }
 function hookInspector(){
   const byId = (id) => document.getElementById(id);
@@ -1616,6 +1916,7 @@ setInterval(refreshStatus, 1000);
   hookInspector();
   hookImageNaturalSize();
   hookStagePointer();
+  hookCropPanel();
   await loadFilterDefs();
   await loadAll();
   await refreshStatus();

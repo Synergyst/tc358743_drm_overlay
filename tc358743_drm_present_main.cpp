@@ -1,6 +1,7 @@
 #ifndef _GNU_SOURCE
 #define _GNU_SOURCE
 #endif
+#include <arm_neon.h>
 #include <assert.h>
 #include <errno.h>
 #include <fcntl.h>
@@ -777,7 +778,7 @@ static void filter_apply_mono(layer_buf &buf, float strength) {
     buf.px[i] = 0xFF000000u | (rr<<16) | (gg<<8) | bb;
   }
 }
-static void filter_apply_sobel(layer_buf &buf, filter_cfg::sobel_mode_t mode, uint8_t threshold, float alpha_f, bool invert) {
+/*static void filter_apply_sobel(layer_buf &buf, filter_cfg::sobel_mode_t mode, uint8_t threshold, float alpha_f, bool invert) {
   if (buf.w < 3 || buf.h < 3) {
     if (mode == filter_cfg::SOBEL_EDGES_ONLY) std::fill(buf.px.begin(), buf.px.end(), 0x00000000u);
     else std::fill(buf.px.begin(), buf.px.end(), 0xFF000000u);
@@ -818,8 +819,179 @@ static void filter_apply_sobel(layer_buf &buf, filter_cfg::sobel_mode_t mode, ui
     }
   }
   buf.px.swap(out);
+}*/
+static void filter_apply_sobel(layer_buf &buf, filter_cfg::sobel_mode_t mode, uint8_t threshold, float alpha_f, bool invert) {
+  if (buf.w < 3 || buf.h < 3) {
+    if (mode == filter_cfg::SOBEL_EDGES_ONLY) std::fill(buf.px.begin(), buf.px.end(), 0x00000000u);
+    else std::fill(buf.px.begin(), buf.px.end(), 0xFF000000u);
+    return;
+  }
+
+  alpha_f = std::clamp(alpha_f, 0.0f, 1.0f);
+  uint8_t edge_a = (uint8_t)std::lround(alpha_f * 255.0f);
+
+  const uint32_t w = buf.w;
+  const uint32_t h = buf.h;
+
+  // 1) Luma
+  std::vector<uint8_t> lum((size_t)w * (size_t)h);
+  for (size_t i=0; i<buf.px.size(); i++) lum[i] = luma_u8_from_xrgb(buf.px[i]);
+
+  // 2) Output
+  std::vector<uint32_t> out(buf.px.size());
+
+  auto idx = [&](uint32_t x, uint32_t y)->size_t { return (size_t)y*(size_t)w + (size_t)x; };
+
+  // borders = 0 (matches your current behavior)
+  for (uint32_t x=0; x<w; x++) { out[idx(x,0)] = 0; out[idx(x,h-1)] = 0; }
+  for (uint32_t y=0; y<h; y++) { out[idx(0,y)] = 0; out[idx(w-1,y)] = 0; }
+
+  // 3) Interior Sobel (NEON)
+  for (uint32_t y=1; y+1<h; y++) {
+    const uint8_t *r0 = &lum[(size_t)(y-1)*w];
+    const uint8_t *r1 = &lum[(size_t)(y)*w];
+    const uint8_t *r2 = &lum[(size_t)(y+1)*w];
+    uint32_t *dst = &out[(size_t)y*w];
+
+    uint32_t x = 1;
+
+#if defined(__ARM_NEON) || defined(__ARM_NEON__)
+    // Process 16 pixels at a time for x in [1 .. w-2]
+    // We compute:
+    // gx = (-p00 + p02) + (-2*p10 + 2*p12) + (-p20 + p22)
+    // gy = (-p00 -2*p01 -p02) + (p20 +2*p21 + p22)
+    // mag = abs(gx) + abs(gy), clamped to 255
+    //
+    // Load windows via 3 loads per row: x-1, x, x+1
+    for (; x + 16 <= w-1; x += 16) {
+      uint8x16_t p00 = vld1q_u8(r0 + x - 1);
+      uint8x16_t p01 = vld1q_u8(r0 + x);
+      uint8x16_t p02 = vld1q_u8(r0 + x + 1);
+
+      uint8x16_t p10 = vld1q_u8(r1 + x - 1);
+      uint8x16_t p12 = vld1q_u8(r1 + x + 1);
+
+      uint8x16_t p20 = vld1q_u8(r2 + x - 1);
+      uint8x16_t p21 = vld1q_u8(r2 + x);
+      uint8x16_t p22 = vld1q_u8(r2 + x + 1);
+
+      // widen to signed 16
+      int16x8_t p00l = vreinterpretq_s16_u16(vmovl_u8(vget_low_u8(p00)));
+      int16x8_t p01l = vreinterpretq_s16_u16(vmovl_u8(vget_low_u8(p01)));
+      int16x8_t p02l = vreinterpretq_s16_u16(vmovl_u8(vget_low_u8(p02)));
+      int16x8_t p10l = vreinterpretq_s16_u16(vmovl_u8(vget_low_u8(p10)));
+      int16x8_t p12l = vreinterpretq_s16_u16(vmovl_u8(vget_low_u8(p12)));
+      int16x8_t p20l = vreinterpretq_s16_u16(vmovl_u8(vget_low_u8(p20)));
+      int16x8_t p21l = vreinterpretq_s16_u16(vmovl_u8(vget_low_u8(p21)));
+      int16x8_t p22l = vreinterpretq_s16_u16(vmovl_u8(vget_low_u8(p22)));
+
+      int16x8_t p00h = vreinterpretq_s16_u16(vmovl_u8(vget_high_u8(p00)));
+      int16x8_t p01h = vreinterpretq_s16_u16(vmovl_u8(vget_high_u8(p01)));
+      int16x8_t p02h = vreinterpretq_s16_u16(vmovl_u8(vget_high_u8(p02)));
+      int16x8_t p10h = vreinterpretq_s16_u16(vmovl_u8(vget_high_u8(p10)));
+      int16x8_t p12h = vreinterpretq_s16_u16(vmovl_u8(vget_high_u8(p12)));
+      int16x8_t p20h = vreinterpretq_s16_u16(vmovl_u8(vget_high_u8(p20)));
+      int16x8_t p21h = vreinterpretq_s16_u16(vmovl_u8(vget_high_u8(p21)));
+      int16x8_t p22h = vreinterpretq_s16_u16(vmovl_u8(vget_high_u8(p22)));
+
+      auto sobel8 = [&](int16x8_t p00, int16x8_t p01, int16x8_t p02,
+                        int16x8_t p10,              int16x8_t p12,
+                        int16x8_t p20, int16x8_t p21, int16x8_t p22) -> uint8x8_t {
+        // gx = (p02 - p00) + 2*(p12 - p10) + (p22 - p20)
+        int16x8_t gx = vsubq_s16(p02, p00);
+        gx = vaddq_s16(gx, vshlq_n_s16(vsubq_s16(p12, p10), 1));
+        gx = vaddq_s16(gx, vsubq_s16(p22, p20));
+
+        // gy = (p20 - p00) + 2*(p21 - p01) + (p22 - p02)
+        int16x8_t gy = vsubq_s16(p20, p00);
+        gy = vaddq_s16(gy, vshlq_n_s16(vsubq_s16(p21, p01), 1));
+        gy = vaddq_s16(gy, vsubq_s16(p22, p02));
+
+        // abs(gx), abs(gy)
+        int16x8_t ax = vabsq_s16(gx);
+        int16x8_t ay = vabsq_s16(gy);
+
+        // mag = ax + ay (still fits in 16-bit: max 2040)
+        uint16x8_t mag = vaddq_u16(vreinterpretq_u16_s16(ax), vreinterpretq_u16_s16(ay));
+
+        // clamp to 255: mag8 = min(mag,255)
+        uint16x8_t mag_clamped = vminq_u16(mag, vdupq_n_u16(255));
+        return vmovn_u16(mag_clamped);
+      };
+
+      uint8x8_t magL = sobel8(p00l,p01l,p02l, p10l,p12l, p20l,p21l,p22l);
+      uint8x8_t magH = sobel8(p00h,p01h,p02h, p10h,p12h, p20h,p21h,p22h);
+      uint8x16_t mag = vcombine_u8(magL, magH);
+
+      if (invert) {
+        mag = vsubq_u8(vdupq_n_u8(255), mag);
+      }
+
+      // Store 16 pixels as XRGB with alpha behavior matching your original.
+      // For edgesOnly: if mag < threshold OR edge_a==0 => write 0.
+      // Else write (edge_a<<24 | mag gray).
+      if (mode == filter_cfg::SOBEL_EDGES_ONLY) {
+        if (edge_a == 0) {
+          // all transparent
+          for (int i=0;i<16;i++) dst[x + (uint32_t)i] = 0x00000000u;
+        } else {
+          uint8x16_t th = vdupq_n_u8(threshold);
+          // mask = (mag >= th)
+          uint8x16_t m = vcgeq_u8(mag, th);
+
+          // We need scalar store because packing 32-bit pixels with per-lane conditional alpha
+          // is messy and usually not the bottleneck compared to Sobel math.
+          alignas(16) uint8_t mag_arr[16];
+          alignas(16) uint8_t m_arr[16];
+          vst1q_u8(mag_arr, mag);
+          vst1q_u8(m_arr, m);
+          for (int i=0;i<16;i++) {
+            if (m_arr[i]) {
+              uint8_t v = mag_arr[i];
+              dst[x + (uint32_t)i] = ((uint32_t)edge_a<<24) | ((uint32_t)v<<16) | ((uint32_t)v<<8) | (uint32_t)v;
+            } else {
+              dst[x + (uint32_t)i] = 0x00000000u;
+            }
+          }
+        }
+      } else {
+        // magnitude mode: opaque grayscale
+        alignas(16) uint8_t mag_arr[16];
+        vst1q_u8(mag_arr, mag);
+        for (int i=0;i<16;i++) {
+          uint8_t v = mag_arr[i];
+          dst[x + (uint32_t)i] = 0xFF000000u | ((uint32_t)v<<16) | ((uint32_t)v<<8) | (uint32_t)v;
+        }
+      }
+    }
+#endif
+
+    // Scalar tail for remaining interior pixels
+    for (; x < w-1; x++) {
+      int p00 = r0[x-1], p01 = r0[x], p02 = r0[x+1];
+      int p10 = r1[x-1],              p12 = r1[x+1];
+      int p20 = r2[x-1], p21 = r2[x], p22 = r2[x+1];
+
+      int gx = (-p00 + p02) + (-2*p10 + 2*p12) + (-p20 + p22);
+      int gy = (-p00 -2*p01 -p02) + (p20 +2*p21 + p22);
+
+      int mag = abs(gx) + abs(gy);
+      if (mag > 255) mag = 255;
+      uint8_t m = (uint8_t)mag;
+      if (invert) m = (uint8_t)(255 - m);
+
+      if (mode == filter_cfg::SOBEL_EDGES_ONLY) {
+        if (m < threshold || edge_a == 0) dst[x] = 0x00000000u;
+        else dst[x] = ((uint32_t)edge_a<<24) | ((uint32_t)m<<16) | ((uint32_t)m<<8) | (uint32_t)m;
+      } else {
+        dst[x] = 0xFF000000u | ((uint32_t)m<<16) | ((uint32_t)m<<8) | (uint32_t)m;
+      }
+    }
+  }
+
+  buf.px.swap(out);
 }
-static void filter_apply_denoise_box(layer_buf &buf, int radius, float strength) {
+/*static void filter_apply_denoise_box(layer_buf &buf, int radius, float strength) {
   radius = std::max(1, std::min(radius, 8));
   strength = std::clamp(strength, 0.0f, 1.0f);
   if (strength <= 0.0f) return;
@@ -908,13 +1080,267 @@ static void filter_apply_denoise_box(layer_buf &buf, int radius, float strength)
     uint32_t bb2= (bb*a + ob *(255-a) + 127)/255;
     buf.px[i] = 0xFF000000u | (rr<<16) | (gg<<8) | bb2;
   }
+}*/
+/*
+  Drop-in faster denoise for RPi CM4:
+  - Luma-only pipeline:
+      1) Extract luma (Y) from XRGB8888
+      2) 3x3 luma clamp (despeckle: removes salt/pepper/speckle)
+      3) Small separable 3-tap blur on luma (reduces grain)
+      4) Blend with original using 'strength' and write grayscale XRGB
+  - NEON is used for the hot loops (AArch64 or ARMv7+NEON).
+  - Keeps config semantics: radius 1..8, strength 0..1. Radius maps to pass count.
+*/
+
+static inline uint8_t clamp_u8_scalar(int v) {
+  return (uint8_t)((v < 0) ? 0 : (v > 255 ? 255 : v));
+}
+
+// Clamp center luma to [localMin, localMax] using a 3x3 neighborhood.
+// This is a cheap salt/pepper + speckle remover.
+static void luma_clamp3x3_neon(std::vector<uint8_t> &y, uint32_t w, uint32_t h) {
+  if (w < 3 || h < 3) return;
+
+  std::vector<uint8_t> out(y.size());
+
+  // Copy borders unchanged
+  memcpy(out.data(), y.data(), (size_t)w);                               // top row
+  memcpy(out.data() + (size_t)(h-1)*w, y.data() + (size_t)(h-1)*w, (size_t)w); // bottom row
+  for (uint32_t yy=1; yy+1<h; yy++) {
+    out[(size_t)yy*w + 0]     = y[(size_t)yy*w + 0];
+    out[(size_t)yy*w + (w-1)] = y[(size_t)yy*w + (w-1)];
+  }
+
+  for (uint32_t yy=1; yy+1<h; yy++) {
+    const uint8_t *r0 = &y[(size_t)(yy-1)*w];
+    const uint8_t *r1 = &y[(size_t)yy*w];
+    const uint8_t *r2 = &y[(size_t)(yy+1)*w];
+    uint8_t *dst = &out[(size_t)yy*w];
+
+    uint32_t x = 1;
+
+#if defined(__ARM_NEON) || defined(__ARM_NEON__)
+    // Process 16 pixels at a time for x in [1 .. w-2]
+    for (; x + 16 <= w-1; x += 16) {
+      // Load 3 rows, with -1/0/+1 shifted windows
+      uint8x16_t a0 = vld1q_u8(r0 + x - 1);
+      uint8x16_t a1 = vld1q_u8(r0 + x);
+      uint8x16_t a2 = vld1q_u8(r0 + x + 1);
+
+      uint8x16_t b0 = vld1q_u8(r1 + x - 1);
+      uint8x16_t b1 = vld1q_u8(r1 + x);
+      uint8x16_t b2 = vld1q_u8(r1 + x + 1);
+
+      uint8x16_t c0 = vld1q_u8(r2 + x - 1);
+      uint8x16_t c1 = vld1q_u8(r2 + x);
+      uint8x16_t c2 = vld1q_u8(r2 + x + 1);
+
+      // min over 9 values
+      uint8x16_t mn = vminq_u8(a0, a1);
+      mn = vminq_u8(mn, a2);
+      mn = vminq_u8(mn, b0);
+      mn = vminq_u8(mn, b1);
+      mn = vminq_u8(mn, b2);
+      mn = vminq_u8(mn, c0);
+      mn = vminq_u8(mn, c1);
+      mn = vminq_u8(mn, c2);
+
+      // max over 9 values
+      uint8x16_t mx = vmaxq_u8(a0, a1);
+      mx = vmaxq_u8(mx, a2);
+      mx = vmaxq_u8(mx, b0);
+      mx = vmaxq_u8(mx, b1);
+      mx = vmaxq_u8(mx, b2);
+      mx = vmaxq_u8(mx, c0);
+      mx = vmaxq_u8(mx, c1);
+      mx = vmaxq_u8(mx, c2);
+
+      // clamp center (b1) into [mn,mx]
+      uint8x16_t v = b1;
+      v = vmaxq_u8(v, mn);
+      v = vminq_u8(v, mx);
+
+      vst1q_u8(dst + x, v);
+    }
+#endif
+
+    // Scalar tail for remaining interior pixels
+    for (; x < w-1; x++) {
+      uint8_t v = r1[x];
+      uint8_t mn = 255, mx = 0;
+      for (int dy=-1; dy<=1; dy++) {
+        const uint8_t *rr = (dy==-1) ? r0 : (dy==0 ? r1 : r2);
+        for (int dx=-1; dx<=1; dx++) {
+          uint8_t t = rr[x + dx];
+          if (t < mn) mn = t;
+          if (t > mx) mx = t;
+        }
+      }
+      if (v < mn) v = mn;
+      if (v > mx) v = mx;
+      dst[x] = v;
+    }
+  }
+
+  y.swap(out);
+}
+
+// 1D 3-tap blur: (1*prev + 2*cur + 1*next) >> 2
+// Horizontal pass (NEON), edges copy-through.
+static void blur3_h_neon(const std::vector<uint8_t> &in, std::vector<uint8_t> &out, uint32_t w, uint32_t h) {
+  out.resize(in.size());
+  if (w == 0 || h == 0) return;
+
+  for (uint32_t y=0; y<h; y++) {
+    const uint8_t *s = &in[(size_t)y*w];
+    uint8_t *d = &out[(size_t)y*w];
+
+    // edges
+    d[0] = s[0];
+    if (w > 1) d[w-1] = s[w-1];
+
+    uint32_t x = 1;
+
+#if defined(__ARM_NEON) || defined(__ARM_NEON__)
+    for (; x + 16 <= w-1; x += 16) {
+      uint8x16_t a = vld1q_u8(s + x - 1);
+      uint8x16_t b = vld1q_u8(s + x);
+      uint8x16_t c = vld1q_u8(s + x + 1);
+
+      // widen to u16
+      uint16x8_t a0 = vmovl_u8(vget_low_u8(a));
+      uint16x8_t b0 = vmovl_u8(vget_low_u8(b));
+      uint16x8_t c0 = vmovl_u8(vget_low_u8(c));
+      uint16x8_t a1 = vmovl_u8(vget_high_u8(a));
+      uint16x8_t b1 = vmovl_u8(vget_high_u8(b));
+      uint16x8_t c1 = vmovl_u8(vget_high_u8(c));
+
+      // (a + 2*b + c) >> 2
+      uint16x8_t s0 = vaddq_u16(vaddq_u16(a0, c0), vshlq_n_u16(b0, 1));
+      uint16x8_t s1 = vaddq_u16(vaddq_u16(a1, c1), vshlq_n_u16(b1, 1));
+      uint8x8_t o0 = vshrn_n_u16(s0, 2);
+      uint8x8_t o1 = vshrn_n_u16(s1, 2);
+      vst1q_u8(d + x, vcombine_u8(o0, o1));
+    }
+#endif
+
+    for (; x < w-1; x++) {
+      int v = (int)s[x-1] + 2*(int)s[x] + (int)s[x+1];
+      d[x] = (uint8_t)(v >> 2);
+    }
+  }
+}
+
+// Vertical blur with same kernel.
+static void blur3_v_neon(const std::vector<uint8_t> &in, std::vector<uint8_t> &out, uint32_t w, uint32_t h) {
+  out.resize(in.size());
+  if (w == 0 || h == 0) return;
+  if (h == 1) { out = in; return; }
+
+  // top/bottom copy
+  memcpy(out.data(), in.data(), (size_t)w);
+  memcpy(out.data() + (size_t)(h-1)*w, in.data() + (size_t)(h-1)*w, (size_t)w);
+
+  for (uint32_t y=1; y+1<h; y++) {
+    const uint8_t *r0 = &in[(size_t)(y-1)*w];
+    const uint8_t *r1 = &in[(size_t)y*w];
+    const uint8_t *r2 = &in[(size_t)(y+1)*w];
+    uint8_t *d = &out[(size_t)y*w];
+
+    uint32_t x = 0;
+
+#if defined(__ARM_NEON) || defined(__ARM_NEON__)
+    for (; x + 16 <= w; x += 16) {
+      uint8x16_t a = vld1q_u8(r0 + x);
+      uint8x16_t b = vld1q_u8(r1 + x);
+      uint8x16_t c = vld1q_u8(r2 + x);
+
+      uint16x8_t a0 = vmovl_u8(vget_low_u8(a));
+      uint16x8_t b0 = vmovl_u8(vget_low_u8(b));
+      uint16x8_t c0 = vmovl_u8(vget_low_u8(c));
+      uint16x8_t a1 = vmovl_u8(vget_high_u8(a));
+      uint16x8_t b1 = vmovl_u8(vget_high_u8(b));
+      uint16x8_t c1 = vmovl_u8(vget_high_u8(c));
+
+      uint16x8_t s0 = vaddq_u16(vaddq_u16(a0, c0), vshlq_n_u16(b0, 1));
+      uint16x8_t s1 = vaddq_u16(vaddq_u16(a1, c1), vshlq_n_u16(b1, 1));
+      uint8x8_t o0 = vshrn_n_u16(s0, 2);
+      uint8x8_t o1 = vshrn_n_u16(s1, 2);
+      vst1q_u8(d + x, vcombine_u8(o0, o1));
+    }
+#endif
+
+    for (; x < w; x++) {
+      int v = (int)r0[x] + 2*(int)r1[x] + (int)r2[x];
+      d[x] = (uint8_t)(v >> 2);
+    }
+  }
+}
+
+static void filter_apply_denoise_box(layer_buf &buf, int radius, float strength) {
+  radius = std::max(1, std::min(radius, 8));
+  strength = std::clamp(strength, 0.0f, 1.0f);
+  if (strength <= 0.0f) return;
+
+  const uint32_t w = buf.w, h = buf.h;
+  if (w == 0 || h == 0) return;
+  if (buf.px.empty()) return;
+
+  // Map "radius" to small pass counts to keep it fast and deterministic.
+  // - radius 1-2: 1 blur pass
+  // - radius 3-5: 2 blur passes
+  // - radius 6-8: 3 blur passes
+  int blur_passes = (radius <= 2) ? 1 : (radius <= 5 ? 2 : 3);
+
+  // 1) Extract luma
+  std::vector<uint8_t> y(buf.px.size());
+  for (size_t i=0; i<buf.px.size(); i++) {
+    y[i] = luma_u8_from_xrgb(buf.px[i]);
+  }
+
+  // 2) Despeckle / salt-pepper: clamp to local range
+  luma_clamp3x3_neon(y, w, h);
+
+  // 3) Small blur passes
+  std::vector<uint8_t> tmp;
+  std::vector<uint8_t> tmp2;
+  for (int p=0; p<blur_passes; p++) {
+    blur3_h_neon(y, tmp, w, h);
+    blur3_v_neon(tmp, tmp2, w, h);
+    y.swap(tmp2);
+  }
+
+  // 4) Blend with original using strength; write grayscale
+  if (strength >= 1.0f) {
+    for (size_t i=0; i<buf.px.size(); i++) {
+      uint8_t v = y[i];
+      buf.px[i] = 0xFF000000u | ((uint32_t)v<<16) | ((uint32_t)v<<8) | (uint32_t)v;
+    }
+    return;
+  }
+
+  const uint32_t a = (uint32_t)std::lround(strength * 255.0f);
+  for (size_t i=0; i<buf.px.size(); i++) {
+    uint32_t orig = buf.px[i];
+    uint32_t orr = (orig >> 16) & 0xFF;
+    uint32_t og  = (orig >> 8) & 0xFF;
+    uint32_t ob  = (orig) & 0xFF;
+
+    uint32_t v = y[i];
+    // Blend each channel toward luma value (keeps "strength" meaning consistent with your other filters)
+    uint32_t rr = (v*a + orr*(255-a) + 127)/255;
+    uint32_t gg = (v*a + og *(255-a) + 127)/255;
+    uint32_t bb = (v*a + ob *(255-a) + 127)/255;
+
+    buf.px[i] = 0xFF000000u | (rr<<16) | (gg<<8) | bb;
+  }
 }
 static inline bool chan_match(int mn, int mx, uint8_t v) {
   // wildcard
   if (mn == -1 && mx == -1) return true;
   return (v >= (uint8_t)mn && v <= (uint8_t)mx);
 }
-static void filter_apply_rgb_map(layer_buf &buf,
+/*static void filter_apply_rgb_map(layer_buf &buf,
                                  int rmin, int rmax, uint8_t rout,
                                  int gmin, int gmax, uint8_t gout,
                                  int bmin, int bmax, uint8_t bout,
@@ -935,6 +1361,177 @@ static void filter_apply_rgb_map(layer_buf &buf,
       buf.px[i] = ((uint32_t)aout << 24) | ((uint32_t)rout << 16) | ((uint32_t)gout << 8) | (uint32_t)bout;
     }
   }
+}*/
+static inline bool chan_is_wildcard(int mn, int mx) { return (mn == -1 && mx == -1); }
+
+// NEON accelerated RGBA range -> RGBA value mapping.
+// Semantics match your existing rgbMap:
+// - If mn/mx are both -1 => wildcard (channel always matches)
+// - Otherwise inclusive range match: mn <= channel <= mx
+// - If all channels match => pixel becomes (aout,rout,gout,bout) packed as A in top byte
+static void filter_apply_rgb_map(layer_buf &buf,
+                                 int rmin, int rmax, uint8_t rout,
+                                 int gmin, int gmax, uint8_t gout,
+                                 int bmin, int bmax, uint8_t bout,
+                                 int amin, int amax, uint8_t aout) {
+  if (buf.w == 0 || buf.h == 0) return;
+  if (buf.px.empty()) return;
+
+  const bool r_wc = chan_is_wildcard(rmin, rmax);
+  const bool g_wc = chan_is_wildcard(gmin, gmax);
+  const bool b_wc = chan_is_wildcard(bmin, bmax);
+  const bool a_wc = chan_is_wildcard(amin, amax);
+
+  // Clamp non-wildcard mins/maxes to [0..255] to avoid UB in comparisons
+  auto clamp_mm = [](int &mn, int &mx) {
+    if (mn == -1 && mx == -1) return;
+    mn = std::max(0, std::min(255, mn));
+    mx = std::max(0, std::min(255, mx));
+    if (mx < mn) std::swap(mx, mn);
+  };
+  clamp_mm(rmin, rmax);
+  clamp_mm(gmin, gmax);
+  clamp_mm(bmin, bmax);
+  clamp_mm(amin, amax);
+
+#if defined(__ARM_NEON) || defined(__ARM_NEON__)
+  const uint32x4_t vout0 = vdupq_n_u32(((uint32_t)aout << 24) | ((uint32_t)rout << 16) | ((uint32_t)gout << 8) | (uint32_t)bout);
+
+  size_t i = 0;
+  const size_t n = buf.px.size();
+
+  // Process 16 pixels (64 bytes) per iteration
+  for (; i + 16 <= n; i += 16) {
+    // Load 16 packed pixels as 4x uint32x4
+    const uint32_t *src = &buf.px[i];
+    uint32x4_t p0 = vld1q_u32(src + 0);
+    uint32x4_t p1 = vld1q_u32(src + 4);
+    uint32x4_t p2 = vld1q_u32(src + 8);
+    uint32x4_t p3 = vld1q_u32(src + 12);
+
+    // Build per-4-pixel 32-bit lane masks directly (clean vbslq_u32 use).
+    // Extract 32-bit lanes for each channel by shifting and masking.
+    const uint32x4_t vff = vdupq_n_u32(0xFFFFFFFFu);
+
+    auto chan_mask_u32 = [&](uint32x4_t chan, int mn, int mx, bool wc) -> uint32x4_t {
+      if (wc) return vff;
+      uint32x4_t vmn = vdupq_n_u32((uint32_t)mn);
+      uint32x4_t vmx = vdupq_n_u32((uint32_t)mx);
+      uint32x4_t ge = vcgeq_u32(chan, vmn);
+      uint32x4_t le = vcleq_u32(chan, vmx);
+      return vandq_u32(ge, le); // 0xFFFFFFFF where in range
+    };
+
+    auto unpack_chan = [&](uint32x4_t p, int shift) -> uint32x4_t {
+      if (shift == 0) return vandq_u32(p, vdupq_n_u32(0xFFu));
+      return vandq_u32(vshrq_n_u32(p, shift), vdupq_n_u32(0xFFu));
+    };
+
+    // r/g/b/a values as u32 lanes (0..255)
+    uint32x4_t r0 = unpack_chan(p0, 16);
+    uint32x4_t g0 = unpack_chan(p0, 8);
+    uint32x4_t b0 = unpack_chan(p0, 0);
+    uint32x4_t a0 = unpack_chan(p0, 24);
+
+    uint32x4_t r1 = unpack_chan(p1, 16);
+    uint32x4_t g1 = unpack_chan(p1, 8);
+    uint32x4_t b1 = unpack_chan(p1, 0);
+    uint32x4_t a1 = unpack_chan(p1, 24);
+
+    uint32x4_t r2 = unpack_chan(p2, 16);
+    uint32x4_t g2 = unpack_chan(p2, 8);
+    uint32x4_t b2 = unpack_chan(p2, 0);
+    uint32x4_t a2 = unpack_chan(p2, 24);
+
+    uint32x4_t r3 = unpack_chan(p3, 16);
+    uint32x4_t g3 = unpack_chan(p3, 8);
+    uint32x4_t b3 = unpack_chan(p3, 0);
+    uint32x4_t a3 = unpack_chan(p3, 24);
+
+    // per-lane masks
+    uint32x4_t mr0 = chan_mask_u32(r0, rmin, rmax, r_wc);
+    uint32x4_t mg0 = chan_mask_u32(g0, gmin, gmax, g_wc);
+    uint32x4_t mb0 = chan_mask_u32(b0, bmin, bmax, b_wc);
+    uint32x4_t ma0 = chan_mask_u32(a0, amin, amax, a_wc);
+    uint32x4_t m0  = vandq_u32(vandq_u32(mr0, mg0), vandq_u32(mb0, ma0));
+
+    uint32x4_t mr1 = chan_mask_u32(r1, rmin, rmax, r_wc);
+    uint32x4_t mg1 = chan_mask_u32(g1, gmin, gmax, g_wc);
+    uint32x4_t mb1 = chan_mask_u32(b1, bmin, bmax, b_wc);
+    uint32x4_t ma1 = chan_mask_u32(a1, amin, amax, a_wc);
+    uint32x4_t m1  = vandq_u32(vandq_u32(mr1, mg1), vandq_u32(mb1, ma1));
+
+    uint32x4_t mr2 = chan_mask_u32(r2, rmin, rmax, r_wc);
+    uint32x4_t mg2 = chan_mask_u32(g2, gmin, gmax, g_wc);
+    uint32x4_t mb2 = chan_mask_u32(b2, bmin, bmax, b_wc);
+    uint32x4_t ma2 = chan_mask_u32(a2, amin, amax, a_wc);
+    uint32x4_t m2  = vandq_u32(vandq_u32(mr2, mg2), vandq_u32(mb2, ma2));
+
+    uint32x4_t mr3 = chan_mask_u32(r3, rmin, rmax, r_wc);
+    uint32x4_t mg3 = chan_mask_u32(g3, gmin, gmax, g_wc);
+    uint32x4_t mb3 = chan_mask_u32(b3, bmin, bmax, b_wc);
+    uint32x4_t ma3 = chan_mask_u32(a3, amin, amax, a_wc);
+    uint32x4_t m3  = vandq_u32(vandq_u32(mr3, mg3), vandq_u32(mb3, ma3));
+
+    // Normalize masks to all-bits set or zero for vbsl.
+    // Any nonzero becomes 0xFFFFFFFF by negating compare against 0.
+    auto norm_mask = [](uint32x4_t mm) -> uint32x4_t {
+      // mm currently has 0x00..00FF style values; compare !=0 -> 0xFFFFFFFF
+      return vcgtq_u32(mm, vdupq_n_u32(0));
+    };
+    m0 = norm_mask(m0);
+    m1 = norm_mask(m1);
+    m2 = norm_mask(m2);
+    m3 = norm_mask(m3);
+
+    // Select output pixel or keep original
+    p0 = vbslq_u32(m0, vout0, p0);
+    p1 = vbslq_u32(m1, vout0, p1);
+    p2 = vbslq_u32(m2, vout0, p2);
+    p3 = vbslq_u32(m3, vout0, p3);
+
+    vst1q_u32((uint32_t*)src + 0, p0);
+    vst1q_u32((uint32_t*)src + 4, p1);
+    vst1q_u32((uint32_t*)src + 8, p2);
+    vst1q_u32((uint32_t*)src + 12, p3);
+  }
+
+  // Scalar tail
+  for (; i < n; i++) {
+    uint32_t p = buf.px[i];
+    uint8_t pr = (uint8_t)((p >> 16) & 0xFF);
+    uint8_t pg = (uint8_t)((p >> 8) & 0xFF);
+    uint8_t pb = (uint8_t)(p & 0xFF);
+    uint8_t pa = (uint8_t)((p >> 24) & 0xFF);
+
+    auto match = [&](int mn, int mx, uint8_t v) -> bool {
+      if (mn == -1 && mx == -1) return true;
+      return (v >= (uint8_t)mn && v <= (uint8_t)mx);
+    };
+
+    if (match(rmin, rmax, pr) && match(gmin, gmax, pg) && match(bmin, bmax, pb) && match(amin, amax, pa)) {
+      buf.px[i] = ((uint32_t)aout << 24) | ((uint32_t)rout << 16) | ((uint32_t)gout << 8) | (uint32_t)bout;
+    }
+  }
+#else
+  // No NEON: scalar fallback (should match your existing behavior)
+  auto match = [&](int mn, int mx, uint8_t v) -> bool {
+    if (mn == -1 && mx == -1) return true;
+    return (v >= (uint8_t)mn && v <= (uint8_t)mx);
+  };
+
+  for (size_t i=0; i<buf.px.size(); i++) {
+    uint32_t p = buf.px[i];
+    uint8_t pr = (uint8_t)((p >> 16) & 0xFF);
+    uint8_t pg = (uint8_t)((p >> 8) & 0xFF);
+    uint8_t pb = (uint8_t)(p & 0xFF);
+    uint8_t pa = (uint8_t)((p >> 24) & 0xFF);
+
+    if (match(rmin, rmax, pr) && match(gmin, gmax, pg) && match(bmin, bmax, pb) && match(amin, amax, pa)) {
+      buf.px[i] = ((uint32_t)aout << 24) | ((uint32_t)rout << 16) | ((uint32_t)gout << 8) | (uint32_t)bout;
+    }
+  }
+#endif
 }
 static inline bool is_key_black(uint8_t r, uint8_t g, uint8_t b, int th) {
   // "close to black": all channels <= threshold

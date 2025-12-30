@@ -909,11 +909,88 @@ static void filter_apply_denoise_box(layer_buf &buf, int radius, float strength)
     buf.px[i] = 0xFF000000u | (rr<<16) | (gg<<8) | bb2;
   }
 }
+static inline bool chan_match(int mn, int mx, uint8_t v) {
+  // wildcard
+  if (mn == -1 && mx == -1) return true;
+  return (v >= (uint8_t)mn && v <= (uint8_t)mx);
+}
+static void filter_apply_rgb_map(layer_buf &buf,
+                                 int rmin, int rmax, uint8_t rout,
+                                 int gmin, int gmax, uint8_t gout,
+                                 int bmin, int bmax, uint8_t bout,
+                                 int amin, int amax, uint8_t aout) {
+  if (buf.w == 0 || buf.h == 0) return;
+
+  for (size_t i = 0; i < buf.px.size(); i++) {
+    uint32_t p = buf.px[i];
+    uint8_t pa = (uint8_t)((p >> 24) & 0xFF);
+    uint8_t r = (uint8_t)((p >> 16) & 0xFF);
+    uint8_t g = (uint8_t)((p >> 8) & 0xFF);
+    uint8_t b = (uint8_t)(p & 0xFF);
+
+    if (chan_match(rmin, rmax, r) &&
+        chan_match(gmin, gmax, g) &&
+        chan_match(bmin, bmax, b) &&
+        chan_match(amin, amax, pa)) {
+      buf.px[i] = ((uint32_t)aout << 24) | ((uint32_t)rout << 16) | ((uint32_t)gout << 8) | (uint32_t)bout;
+    }
+  }
+}
+static inline bool is_key_black(uint8_t r, uint8_t g, uint8_t b, int th) {
+  // "close to black": all channels <= threshold
+  return (r <= th) && (g <= th) && (b <= th);
+}
+static inline bool is_key_white(uint8_t r, uint8_t g, uint8_t b, int th) {
+  // "close to white": all channels >= 255-th
+  const int lo = 255 - th;
+  return (r >= lo) && (g >= lo) && (b >= lo);
+}
+
+static void filter_apply_rgb_key_alpha(layer_buf &buf,
+                                       filter_cfg::key_mode_t mode,
+                                       int threshold,
+                                       uint8_t keyA,
+                                       uint8_t keepA,
+                                       bool setRgb,
+                                       uint8_t outR, uint8_t outG, uint8_t outB) {
+  if (buf.w == 0 || buf.h == 0) return;
+  threshold = std::max(0, std::min(threshold, 255));
+
+  for (size_t i = 0; i < buf.px.size(); i++) {
+    uint32_t p = buf.px[i];
+    uint8_t r = (uint8_t)((p >> 16) & 0xFF);
+    uint8_t g = (uint8_t)((p >> 8) & 0xFF);
+    uint8_t b = (uint8_t)(p & 0xFF);
+
+    bool keyed = (mode == filter_cfg::KEY_WHITE)
+      ? is_key_white(r, g, b, threshold)
+      : is_key_black(r, g, b, threshold);
+
+    uint8_t a = keyed ? keyA : keepA;
+
+    if (setRgb) {
+      r = outR; g = outG; b = outB;
+    }
+    buf.px[i] = ((uint32_t)a << 24) | ((uint32_t)r << 16) | ((uint32_t)g << 8) | (uint32_t)b;
+  }
+}
 static void apply_filter_chain(layer_buf &buf, const std::vector<filter_cfg> &filters) {
   for (const auto &f : filters) {
-    if (f.id == FILTER_MONO) filter_apply_mono(buf, f.mono_strength);
-    else if (f.id == FILTER_SOBEL) filter_apply_sobel(buf, f.sobel_mode, f.sobel_threshold, f.sobel_alpha, f.sobel_invert);
-    else if (f.id == FILTER_DENOISE) filter_apply_denoise_box(buf, f.denoise_radius, f.denoise_strength);
+    if (f.id == FILTER_MONO) {
+      filter_apply_mono(buf, f.mono_strength);
+    } else if (f.id == FILTER_SOBEL) {
+      filter_apply_sobel(buf, f.sobel_mode, f.sobel_threshold, f.sobel_alpha, f.sobel_invert);
+    } else if (f.id == FILTER_DENOISE) {
+      filter_apply_denoise_box(buf, f.denoise_radius, f.denoise_strength);
+    } else if (f.id == FILTER_RGB_MAP) {
+      filter_apply_rgb_map(buf,
+                           f.r_min, f.r_max, f.r_out,
+                           f.g_min, f.g_max, f.g_out,
+                           f.b_min, f.b_max, f.b_out,
+                           f.a_min, f.a_max, f.a_out);
+    } else if (f.id == FILTER_RGB_KEY_ALPHA) {
+      filter_apply_rgb_key_alpha(buf, f.key_mode, f.key_threshold, f.key_alpha, f.keep_alpha, f.set_rgb, f.out_r, f.out_g, f.out_b);
+    }
   }
 }
 

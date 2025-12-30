@@ -3,7 +3,7 @@
 ls /dev/video*
 v4l2-ctl --list-devices
 #for m in {0,1} ; do
-for m in {0,1} ; do
+for m in {2,3} ; do
   echo
   echo
   echo

@@ -10,7 +10,7 @@ struct point_i32 { int32_t x=0,y=0; };
 enum layer_invert_rel { INV_NONE=0, INV_LOWER=1, INV_UPPER=2 };
 enum layer_type { LAYER_VIDEO=0, LAYER_CROSSHAIR=1, LAYER_GRAPHICS=2 };
 
-enum filter_id { FILTER_MONO=1, FILTER_SOBEL=2, FILTER_DENOISE=3, FILTER_UNKNOWN=0 };
+enum filter_id { FILTER_MONO=1, FILTER_SOBEL=2, FILTER_DENOISE=3, FILTER_RGB_MAP=4, FILTER_RGB_KEY_ALPHA=5, FILTER_UNKNOWN=0 };
 
 struct filter_cfg {
   filter_id id = FILTER_UNKNOWN;
@@ -24,6 +24,23 @@ struct filter_cfg {
   // Denoise (simple box blur in layer space)
   int denoise_radius = 1;     // 1..8 (suggest)
   float denoise_strength = 1.0f; // 0..1 blend with original
+
+  // RGB range -> RGB value mapping filter ("rgbMap")
+  // Match: if min/max are -1, that channel is wildcard (always matches).
+  // If matches, output pixel becomes (r_out, g_out, b_out) keeping alpha=255.
+  int r_min = -1, r_max = -1; uint8_t r_out = 255;
+  int g_min = -1, g_max = -1; uint8_t g_out = 255;
+  int b_min = -1, b_max = -1; uint8_t b_out = 255;
+  int a_min = -1, a_max = -1; uint8_t a_out = 255;
+
+  // rgbKeyAlpha: convert RGB to a given value while keying near-black/near-white to a given alpha.
+  // If "setRgb" is false, RGB is preserved; only alpha is modified.
+  enum key_mode_t { KEY_BLACK=0, KEY_WHITE=1 } key_mode = KEY_BLACK;
+  int key_threshold = 16;     // 0..255, how close to black/white counts as key
+  uint8_t key_alpha = 0;      // alpha for keyed pixels
+  uint8_t keep_alpha = 255;   // alpha for non-keyed pixels
+  bool set_rgb = false;       // if true, set RGB to out_r/out_g/out_b (for all pixels)
+  uint8_t out_r = 255, out_g = 255, out_b = 255;
 };
 
 struct crosshair_layer_cfg {

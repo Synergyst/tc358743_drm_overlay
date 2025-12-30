@@ -141,6 +141,33 @@ json filter_registry_json() {
     f["params"] = { {"radius", 1}, {"strength", 1.0} };
     filters.push_back(f);
   }
+  {
+    json f;
+    f["id"] = "rgbMap";
+    f["name"] = "RGB range → RGB value";
+    // Use -1/-1 as wildcard for a channel.
+    f["params"] = {
+      {"rMin", 0},   {"rMax", 127}, {"rOut", 255},
+      {"gMin", -1},  {"gMax", -1},  {"gOut", 255},
+      {"bMin", -1},  {"bMax", -1},  {"bOut", 127},
+      {"aMin", -1},  {"aMax", -1},  {"aOut", 255}
+    };
+    filters.push_back(f);
+  }
+  {
+    json f;
+    f["id"] = "rgbKeyAlpha";
+    f["name"] = "RGB key → alpha (black/white mask)";
+    f["params"] = {
+      {"mode", "black"},        // "black" | "white"
+      {"threshold", 16},        // 0..255
+      {"keyAlpha", 0},          // 0..255
+      {"keepAlpha", 255},       // 0..255
+      {"setRgb", false},        // true => force RGB to outRgb
+      {"outRgb", "255,255,255"} // CSV string for convenience
+    };
+    filters.push_back(f);
+  }
   j["filters"] = filters;
   return j;
 }
@@ -213,6 +240,24 @@ std::string config_to_json(const persisted_config &c_in) {
           jf["params"] = {
             {"radius", F.denoise_radius},
             {"strength", std::clamp(F.denoise_strength, 0.0f, 1.0f)}
+          };
+        } else if (F.id == FILTER_RGB_MAP) {
+          jf["id"] = "rgbMap";
+          jf["params"] = {
+            {"rMin", F.r_min}, {"rMax", F.r_max}, {"rOut", (int)F.r_out},
+            {"gMin", F.g_min}, {"gMax", F.g_max}, {"gOut", (int)F.g_out},
+            {"bMin", F.b_min}, {"bMax", F.b_max}, {"bOut", (int)F.b_out},
+            {"aMin", F.a_min}, {"aMax", F.a_max}, {"aOut", (int)F.a_out},
+          };
+        } else if (F.id == FILTER_RGB_KEY_ALPHA) {
+          jf["id"] = "rgbKeyAlpha";
+          jf["params"] = {
+            {"mode", (F.key_mode == filter_cfg::KEY_WHITE) ? "white" : "black"},
+            {"threshold", F.key_threshold},
+            {"keyAlpha", (int)F.key_alpha},
+            {"keepAlpha", (int)F.keep_alpha},
+            {"setRgb", F.set_rgb},
+            {"outRgb", std::to_string((int)F.out_r) + "," + std::to_string((int)F.out_g) + "," + std::to_string((int)F.out_b)}
           };
         } else {
           jf["id"] = "unknown";
@@ -393,6 +438,84 @@ bool config_from_json_text(const std::string &text, persisted_config &c) {
 
               double st = jf["params"].value("strength", 1.0);
               fc.denoise_strength = (float)std::clamp(st, 0.0, 1.0);
+            }
+          } else if (id == "rgbMap") {
+            fc.id = FILTER_RGB_MAP;
+            if (jf.contains("params") && jf["params"].is_object()) {
+              const auto &p = jf["params"];
+
+              auto get_i = [&](const char *k, int defv) -> int {
+                if (p.contains(k) && p[k].is_number_integer()) return p[k].get<int>();
+                return defv;
+              };
+              auto get_u8 = [&](const char *k, int defv) -> uint8_t {
+                int v = defv;
+                if (p.contains(k) && p[k].is_number_integer()) v = p[k].get<int>();
+                if (v < 0) v = 0;
+                if (v > 255) v = 255;
+                return (uint8_t)v;
+              };
+              auto clamp_minmax = [&](int &mn, int &mx) {
+                // wildcard if both -1
+                if (mn == -1 && mx == -1) return;
+                // allow user to specify just one side? treat missing as wildcard is tricky;
+                // here: clamp to [0..255] and fix ordering
+                mn = std::max(0, std::min(255, mn));
+                mx = std::max(0, std::min(255, mx));
+                if (mx < mn) std::swap(mx, mn);
+              };
+
+              fc.r_min = get_i("rMin", 0);
+              fc.r_max = get_i("rMax", 255);
+              fc.r_out = get_u8("rOut", 255);
+
+              fc.g_min = get_i("gMin", -1);
+              fc.g_max = get_i("gMax", -1);
+              fc.g_out = get_u8("gOut", 255);
+
+              fc.b_min = get_i("bMin", -1);
+              fc.b_max = get_i("bMax", -1);
+              fc.b_out = get_u8("bOut", 255);
+
+              fc.a_min = get_i("aMin", -1);
+              fc.a_max = get_i("aMax", -1);
+              fc.a_out = get_u8("aOut", 255);
+
+              clamp_minmax(fc.r_min, fc.r_max);
+              clamp_minmax(fc.g_min, fc.g_max);
+              clamp_minmax(fc.b_min, fc.b_max);
+              clamp_minmax(fc.a_min, fc.a_max);
+            }
+          } else if (id == "rgbKeyAlpha") {
+            fc.id = FILTER_RGB_KEY_ALPHA;
+            if (jf.contains("params") && jf["params"].is_object()) {
+              const auto &p = jf["params"];
+
+              std::string mode = p.value("mode", "black");
+              fc.key_mode = (mode == "white") ? filter_cfg::KEY_WHITE : filter_cfg::KEY_BLACK;
+
+              int th = p.value("threshold", 16);
+              if (th < 0) th = 0;
+              if (th > 255) th = 255;
+              fc.key_threshold = th;
+
+              int ka = p.value("keyAlpha", 0);
+              if (ka < 0) ka = 0;
+              if (ka > 255) ka = 255;
+              fc.key_alpha = (uint8_t)ka;
+
+              int na = p.value("keepAlpha", 255);
+              if (na < 0) na = 0;
+              if (na > 255) na = 255;
+              fc.keep_alpha = (uint8_t)na;
+
+              fc.set_rgb = p.value("setRgb", false);
+
+              std::string outRgb = p.value("outRgb", "255,255,255");
+              uint8_t rr=255, gg=255, bb=255;
+              if (parse_rgb_csv(outRgb.c_str(), &rr, &gg, &bb)) {
+                fc.out_r = rr; fc.out_g = gg; fc.out_b = bb;
+              }
             }
           } else {
             continue;

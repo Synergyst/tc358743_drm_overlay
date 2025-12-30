@@ -617,12 +617,56 @@ const FILTER_FALLBACK = {
         { k:"alpha", type:"float", min:0.0, max:1.0, default:1.0 },
         { k:"invert", type:"bool", default:false }
       ]
+    },
+    {
+      id: "denoise",
+      name: "Denoise",
+      params: [
+        { k:"radius", type:"int", min:1, max:8, default:1 },
+        { k:"strength", type:"float", min:0.0, max:8.0, default:1.0 }
+      ]
+    },
+    {
+      id: "rgbMap",
+      name: "RGB range → RGB value",
+      params: [
+        { k:"rMin", type:"int", min:-1, max:255, default:0 },
+        { k:"rMax", type:"int", min:-1, max:255, default:255 },
+        { k:"rOut", type:"int", min:0,  max:255, default:255 },
+
+        { k:"gMin", type:"int", min:-1, max:255, default:-1 },
+        { k:"gMax", type:"int", min:-1, max:255, default:-1 },
+        { k:"gOut", type:"int", min:0,  max:255, default:255 },
+
+        { k:"bMin", type:"int", min:-1, max:255, default:-1 },
+        { k:"bMax", type:"int", min:-1, max:255, default:-1 },
+        { k:"bOut", type:"int", min:0,  max:255, default:127 },
+
+        { k:"aMin", type:"int", min:-1, max:255, default:-1 },
+        { k:"aMax", type:"int", min:-1, max:255, default:-1 },
+        { k:"aOut", type:"int", min:0,  max:255, default:255 }
+      ]
+    },
+    {
+      id: "rgbKeyAlpha",
+      name: "RGB key → alpha (black/white mask)",
+      params: [
+        { k:"mode", type:"enum", values:["black","white"], default:"black" },
+        { k:"threshold", type:"int", min:0, max:255, default:16 },
+        { k:"keyAlpha", type:"int", min:0, max:255, default:0 },
+        { k:"keepAlpha", type:"int", min:0, max:255, default:255 },
+        { k:"setRgb", type:"bool", default:false },
+        { k:"outRgb", type:"string", default:"255,255,255" }
+      ]
     }
   ]
 };
 function schemaForKnownFilterId(id){
   if (id === 'mono') return FILTER_FALLBACK.filters[0].params;
   if (id === 'sobel') return FILTER_FALLBACK.filters[1].params;
+  if (id === 'denoise') return FILTER_FALLBACK.filters[2].params;
+  if (id === 'rgbMap') return FILTER_FALLBACK.filters[3].params;
+  if (id === 'rgbKeyAlpha') return FILTER_FALLBACK.filters[4].params;
   return [];
 }
 function normalizeFilterDef(def){

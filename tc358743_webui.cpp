@@ -1960,7 +1960,7 @@ function renderAll(){
   renderInspector();
   renderStage();
 }
-setInterval(refreshStatus, 1000);
+setInterval(refreshStatus, 60000);
 (async () => {
   hookGlobalUI();
   hookInspector();

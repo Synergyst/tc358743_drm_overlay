@@ -1735,7 +1735,7 @@ static void filter_apply_m3lite_edge_mask(layer_buf &buf) {
   const float   sobel2_alpha     = 1.0f;  // edgesOnly alpha
   const bool    sobel_invert     = false;
 
-  const uint8_t edge_on_threshold = 42;   // after double-sobel, consider this “edge present”
+  const uint8_t edge_on_threshold = 24;   // after double-sobel, consider this “edge present”
   const int     thicken_radius = 1;       // 1 => 3x3 dilation (thicker lines)
   const uint8_t out_a = 64;               // alpha for green lines
   // ------------------------------------------
@@ -2453,8 +2453,15 @@ struct pipeline {
       }
     }
 
-    if (sources.empty()) {
-      fprintf(stderr, "[pipeline] no active sources; init failed\n");
+    // Continue startup as long as the configured default v4l2Dev came up.
+    // This allows boot even if one HDMI input has no signal/cable.
+    bool have_default = false;
+    for (auto &sc : sources) {
+      if (sc && sc->dev == cfg.v4l2_dev) { have_default = true; break; }
+    }
+
+    if (!have_default) {
+      fprintf(stderr, "[pipeline] default source not active (%s); init failed\n", cfg.v4l2_dev.c_str());
       return false;
     }
 

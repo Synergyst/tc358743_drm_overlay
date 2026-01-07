@@ -55,6 +55,25 @@ struct crosshair_layer_cfg {
   layer_invert_rel invert_rel=INV_NONE;
 };
 
+// OAK per-layer role:
+// - NONE: layer behaves normally
+// - VISIBLE_IN: this layer's (layer-space) buffer is sent to OAK as "visible"
+// - THERMAL_IN: this layer's (layer-space) buffer is sent to OAK as "thermal"
+// - OUTPUT: this layer displays OAK output instead of its own sampled pixels
+enum oak_role {
+  OAK_NONE = 0,
+  OAK_VISIBLE_IN = 1,
+  OAK_THERMAL_IN = 2,
+  OAK_OUTPUT = 3,
+};
+
+struct oak_layer_cfg {
+  bool enabled = false;           // master switch for this layer participating in OAK pipeline
+  oak_role role = OAK_NONE;       // visible/thermal/output
+  // Future: warp params, thresholds, etc.
+  // For v0, processing is fixed in oak_accel.cpp Script.
+};
+
 struct layer_cfg {
   std::string name="Layer";
   layer_type type=LAYER_VIDEO;
@@ -68,6 +87,9 @@ struct layer_cfg {
   layer_invert_rel invert_rel=INV_NONE;
   crosshair_layer_cfg xh{};
   std::vector<filter_cfg> filters{};
+
+  // New: optional OAK usage
+  oak_layer_cfg oak{};
 };
 
 struct viewport_cfg { bool set=false; uint32_t w=0,h=0; };
@@ -105,6 +127,13 @@ struct persisted_config {
   viewport_cfg viewport{};
   std::vector<layer_cfg> layers{};
   std::string listen_addr="0.0.0.0";
+
+  // New: OAK device selection and processing size.
+  // If oak_enable is false, the program behaves exactly as before.
+  bool oak_enable = false;
+  std::string oak_mxid = "";       // optional specific device MxId, empty => first device
+  uint32_t oak_w = 320;
+  uint32_t oak_h = 180;
 };
 
 bool present_policy_valid(const std::string &p);

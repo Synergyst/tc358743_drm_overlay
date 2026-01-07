@@ -64,6 +64,24 @@ static void uniq_push(std::vector<std::string> &out, const std::string &s) {
   if (std::find(out.begin(), out.end(), s) == out.end()) out.push_back(s);
 }
 
+// ---------------- OAK helpers ----------------
+static const char* oak_role_to_string(oak_role r) {
+  switch(r) {
+    case OAK_NONE:       return "none";
+    case OAK_VISIBLE_IN: return "visible";
+    case OAK_THERMAL_IN: return "thermal";
+    case OAK_OUTPUT:     return "output";
+    default:             return "none";
+  }
+}
+
+static oak_role oak_role_from_string(const std::string& s) {
+  if (s == "visible") return OAK_VISIBLE_IN;
+  if (s == "thermal") return OAK_THERMAL_IN;
+  if (s == "output")  return OAK_OUTPUT;
+  return OAK_NONE;
+}
+
 void cfg_normalize(persisted_config &c) {
   // Ensure tc order
   std::vector<std::string> tc;
@@ -99,6 +117,21 @@ void cfg_normalize(persisted_config &c) {
     aux.push_back(a);
   }
   c.aux_sources = aux;
+
+  // ---- OAK defaults / sanitization ----
+  if (c.oak_w == 0) c.oak_w = 320;
+  if (c.oak_h == 0) c.oak_h = 180;
+  // Keep it bounded to something sane for your use-case
+  if (c.oak_w > 1920) c.oak_w = 1920;
+  if (c.oak_h > 1080) c.oak_h = 1080;
+
+  // Per-layer oak fields: no heavy normalization, just clamp roles for non-video
+  for (auto &L : c.layers) {
+    if (L.type != LAYER_VIDEO) {
+      L.oak.enabled = false;
+      L.oak.role = OAK_NONE;
+    }
+  }
 }
 
 std::vector<std::string> cfg_effective_sources(const persisted_config &c_in) {
@@ -210,6 +243,12 @@ std::string config_to_json(const persisted_config &c_in) {
   j["viewport"] = c.viewport.set ? (std::to_string(c.viewport.w) + "x" + std::to_string(c.viewport.h)) : "";
   j["listenAddr"] = c.listen_addr;
 
+  // ---- OAK config ----
+  j["oakEnable"] = c.oak_enable;
+  j["oakMxid"] = c.oak_mxid;
+  j["oakW"] = c.oak_w;
+  j["oakH"] = c.oak_h;
+
   json layers = json::array();
   for (const auto &L : c.layers) {
     json jl;
@@ -226,6 +265,10 @@ std::string config_to_json(const persisted_config &c_in) {
       jl["scale"] = sc.str();
     }
     if (L.type == LAYER_VIDEO) jl["videoSource"] = L.video_source;
+
+    // ---- OAK per-layer ----
+    jl["oakEnabled"] = (L.type == LAYER_VIDEO) ? (bool)L.oak.enabled : false;
+    jl["oakRole"] = (L.type == LAYER_VIDEO) ? std::string(oak_role_to_string(L.oak.role)) : std::string("none");
 
     json fl = json::array();
     if (L.type == LAYER_VIDEO) {
@@ -339,6 +382,18 @@ bool config_from_json_text(const std::string &text, persisted_config &c) {
 
   get_str("listenAddr", c.listen_addr);
 
+  // ---- OAK global config (optional) ----
+  if (j.contains("oakEnable") && j["oakEnable"].is_boolean()) c.oak_enable = j["oakEnable"].get<bool>();
+  if (j.contains("oakMxid") && j["oakMxid"].is_string()) c.oak_mxid = j["oakMxid"].get<std::string>();
+  if (j.contains("oakW") && j["oakW"].is_number_integer()) {
+    int w = j["oakW"].get<int>();
+    if (w > 0) c.oak_w = (uint32_t)w;
+  }
+  if (j.contains("oakH") && j["oakH"].is_number_integer()) {
+    int h = j["oakH"].get<int>();
+    if (h > 0) c.oak_h = (uint32_t)h;
+  }
+
   // New: tc358743Order
   if (j.contains("tc358743Order") && j["tc358743Order"].is_array()) {
     c.tc358743_order.clear();
@@ -372,6 +427,7 @@ bool config_from_json_text(const std::string &text, persisted_config &c) {
     for (const auto &jl : j["layers"]) {
       if (!jl.is_object()) continue;
       layer_cfg L;
+
       if (jl.contains("name") && jl["name"].is_string()) L.name = jl["name"].get<std::string>();
       std::string type = jl.value("type", "video");
       if (type=="crosshair") L.type = LAYER_CROSSHAIR;
@@ -410,6 +466,16 @@ bool config_from_json_text(const std::string &text, persisted_config &c) {
         if (sscanf(scale.c_str(), "%lf,%lf", &sx,&sy)==2 && sx>0.0001 && sy>0.0001) {
           L.scale_x=(float)sx; L.scale_y=(float)sy;
         }
+      }
+
+      // ---- OAK per-layer ----
+      // Defaults already: enabled=false, role=none
+      if (L.type == LAYER_VIDEO) {
+        if (jl.contains("oakEnabled") && jl["oakEnabled"].is_boolean()) L.oak.enabled = jl["oakEnabled"].get<bool>();
+        if (jl.contains("oakRole") && jl["oakRole"].is_string()) L.oak.role = oak_role_from_string(jl["oakRole"].get<std::string>());
+      } else {
+        L.oak.enabled = false;
+        L.oak.role = OAK_NONE;
       }
 
       // Filters

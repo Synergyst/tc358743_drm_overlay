@@ -1,0 +1,825 @@
+#ifndef _GNU_SOURCE
+#define _GNU_SOURCE
+#endif
+#include <arm_neon.h>
+#include <assert.h>
+#include <errno.h>
+#include <fcntl.h>
+#include <linux/videodev2.h>
+#include <poll.h>
+#include <pthread.h>
+#include <sched.h>
+#include <stdbool.h>
+#include <stdint.h>
+#include <stdio.h>
+#include <stdlib.h>
+#include <string.h>
+#include <sys/ioctl.h>
+#include <sys/mman.h>
+#include <termios.h>
+#include <unistd.h>
+#include <time.h>
+#include <libv4l2.h>
+#include <xf86drm.h>
+#include <xf86drmMode.h>
+#include <libdrm/drm.h>
+#include <libdrm/drm_mode.h>
+#include <libdrm/drm_fourcc.h>
+#include <atomic>
+#include <mutex>
+#include <string>
+#include <thread>
+#include <vector>
+#include <sstream>
+#include <fstream>
+#include <algorithm>
+#include <cmath>
+
+#include "third_party/json.hpp"
+#include "tc358743_webui.h"
+#include "overlay_backend.h"
+#include "v4l2_caps.h"
+#include "v4l2_convert.h"
+
+// NEW (OAK)
+#include "oak_accel.h"
+
+using nlohmann::json;
+
+// -------------------- Helpers --------------------
+static void die(const char *msg) { perror(msg); exit(1); }
+static int xioctl(int fd, int req, void *arg) {
+  int r;
+  do { r = ioctl(fd, req, arg); } while (r == -1 && errno == EINTR);
+  return r;
+}
+static int set_fd_nonblocking(int fd) {
+  int flags = fcntl(fd, F_GETFL, 0);
+  if (flags < 0) return -1;
+  if (fcntl(fd, F_SETFL, flags | O_NONBLOCK) < 0) return -1;
+  return 0;
+}
+static std::string slurp_file(const std::string &path) {
+  std::ifstream f(path);
+  if (!f.is_open()) return {};
+  std::stringstream ss;
+  ss << f.rdbuf();
+  return ss.str();
+}
+static bool write_file_atomic(const std::string &path, const std::string &data) {
+  std::string tmp = path + ".tmp";
+  {
+    std::ofstream f(tmp, std::ios::trunc);
+    if (!f.is_open()) return false;
+    f << data;
+    f.flush();
+    if (!f.good()) return false;
+  }
+  if (rename(tmp.c_str(), path.c_str()) != 0) return false;
+  return true;
+}
+static uint64_t monotonic_ms() {
+  struct timespec ts;
+  clock_gettime(CLOCK_MONOTONIC, &ts);
+  return (uint64_t)ts.tv_sec * 1000ull + (uint64_t)ts.tv_nsec / 1000000ull;
+}
+
+// ---------------- raw terminal (q to quit) ----------------
+static struct termios orig_termios;
+static void disableRawMode(void) { tcsetattr(STDIN_FILENO, TCSAFLUSH, &orig_termios); }
+static void enableRawModeNonBlockingStdin(void) {
+  tcgetattr(STDIN_FILENO, &orig_termios);
+  atexit(disableRawMode);
+  struct termios raw = orig_termios;
+  raw.c_lflag &= ~(ECHO | ICANON | ISIG);
+  tcsetattr(STDIN_FILENO, TCSAFLUSH, &raw);
+  if (set_fd_nonblocking(STDIN_FILENO) != 0) {
+    fprintf(stderr, "[warn] could not set stdin nonblocking: %s\n", strerror(errno));
+  }
+}
+
+// ---------------- OAK global (shared) ----------------
+// We keep a single device connection and share latest buffers.
+// Worker threads can feed inputs and read output (thread-safe).
+static std::mutex g_oak_mtx;
+static OakAccel g_oak;
+static bool g_oak_inited = false;
+static std::string g_oak_last_err;
+static std::atomic<uint64_t> g_oak_seq{1};
+
+// Latest OAK output (GRAY8 oakW*oakH) and its seq
+static std::mutex g_oak_out_mtx;
+static std::vector<uint8_t> g_oak_out_gray;
+static uint64_t g_oak_out_seq = 0;
+
+// Initialize lazily when cfg.oak_enable is true.
+static void oak_maybe_init_locked(const persisted_config& cfg) {
+  if (!cfg.oak_enable) return;
+  if (g_oak_inited) return;
+  std::string err;
+  if (!g_oak.init(cfg.oak_mxid, (int)cfg.oak_w, (int)cfg.oak_h, &err)) {
+    g_oak_last_err = err;
+    fprintf(stderr, "[oak] init failed: %s\n", err.c_str());
+    g_oak_inited = false;
+    return;
+  }
+  g_oak_inited = true;
+  g_oak_last_err.clear();
+  fprintf(stderr, "[oak] initialized w=%u h=%u mxid='%s'\n", cfg.oak_w, cfg.oak_h, cfg.oak_mxid.c_str());
+}
+static void oak_shutdown_locked() {
+  if (!g_oak_inited) return;
+  g_oak.shutdown();
+  g_oak_inited = false;
+  g_oak_last_err.clear();
+  {
+    std::lock_guard<std::mutex> lk(g_oak_out_mtx);
+    g_oak_out_gray.clear();
+    g_oak_out_seq = 0;
+  }
+}
+
+// ---------------- V4L2 capture ----------------
+struct cap_buf { void *start; size_t length; };
+static bool read_file_binary(const char *path, uint8_t **out_buf, size_t *out_len) {
+  *out_buf = NULL; *out_len = 0;
+  FILE *f = fopen(path, "rb");
+  if (!f) return false;
+  if (fseek(f, 0, SEEK_END) != 0) { fclose(f); return false; }
+  long len = ftell(f);
+  if (len <= 0) { fclose(f); return false; }
+  if (fseek(f, 0, SEEK_SET) != 0) { fclose(f); return false; }
+  uint8_t *buf = (uint8_t*)malloc((size_t)len);
+  if (!buf) { fclose(f); return false; }
+  size_t rd = fread(buf, 1, (size_t)len, f);
+  fclose(f);
+  if (rd != (size_t)len) { free(buf); return false; }
+  *out_buf = buf; *out_len = (size_t)len;
+  return true;
+}
+static void fix_edid_checksums_inplace(uint8_t *edid, size_t len) {
+  if (len % 128 != 0) return;
+  size_t blocks = len / 128;
+  for (size_t b=0;b<blocks;b++) {
+    uint8_t sum = 0;
+    uint8_t *blk = edid + b*128;
+    for (int i=0;i<127;i++) sum = (uint8_t)(sum + blk[i]);
+    blk[127] = (uint8_t)(0x100 - sum);
+  }
+}
+static int v4l2_set_edid_if_requested(int fd, const char *edid_path) {
+  if (!edid_path || !edid_path[0]) return 0;
+  uint8_t *edid=NULL; size_t len=0;
+  if (!read_file_binary(edid_path, &edid, &len)) return -1;
+  if (len < 128 || (len % 128) != 0) { free(edid); return -1; }
+  fix_edid_checksums_inplace(edid, len);
+  struct v4l2_edid vedid;
+  memset(&vedid, 0, sizeof(vedid));
+  vedid.start_block = 0;
+  vedid.blocks = (uint32_t)(len/128);
+  vedid.edid = edid;
+  int rc = xioctl(fd, VIDIOC_S_EDID, &vedid);
+  free(edid);
+  if (rc < 0) fprintf(stderr, "[v4l2] VIDIOC_S_EDID failed: %s\n", strerror(errno));
+  return rc;
+}
+static int tc358743_query_dv_timings(int fd, uint32_t *out_w, uint32_t *out_h, uint64_t *out_pixelclock) {
+  struct v4l2_dv_timings t;
+  memset(&t, 0, sizeof(t));
+  if (xioctl(fd, VIDIOC_QUERY_DV_TIMINGS, &t) < 0) return -1;
+  if (out_w) *out_w = t.bt.width;
+  if (out_h) *out_h = t.bt.height;
+  if (out_pixelclock) *out_pixelclock = t.bt.pixelclock;
+  return 0;
+}
+static int tc358743_query_and_set_dv_timings(int fd, uint32_t *out_w, uint32_t *out_h, uint64_t *out_pixelclock, bool log) {
+  struct v4l2_dv_timings t;
+  memset(&t, 0, sizeof(t));
+  if (xioctl(fd, VIDIOC_QUERY_DV_TIMINGS, &t) < 0) {
+    fprintf(stderr, "[v4l2] VIDIOC_QUERY_DV_TIMINGS failed: %s\n", strerror(errno));
+    return -1;
+  }
+  if (xioctl(fd, VIDIOC_S_DV_TIMINGS, &t) < 0) {
+    fprintf(stderr, "[v4l2] VIDIOC_S_DV_TIMINGS failed: %s\n", strerror(errno));
+    return -1;
+  }
+  if (out_w) *out_w = t.bt.width;
+  if (out_h) *out_h = t.bt.height;
+  if (out_pixelclock) *out_pixelclock = t.bt.pixelclock;
+  if (log) fprintf(stderr, "[v4l2] DV timings: %ux%u pixelclock=%llu\n", t.bt.width, t.bt.height, (unsigned long long)t.bt.pixelclock);
+  return 0;
+}
+static int v4l2_get_current_fmt(int fd, uint32_t *out_w, uint32_t *out_h, uint32_t *out_stride, uint32_t *out_pixfmt) {
+  struct v4l2_format fmt;
+  memset(&fmt, 0, sizeof(fmt));
+  fmt.type = V4L2_BUF_TYPE_VIDEO_CAPTURE;
+  if (xioctl(fd, VIDIOC_G_FMT, &fmt) < 0) return -1;
+  if (out_w) *out_w = fmt.fmt.pix.width;
+  if (out_h) *out_h = fmt.fmt.pix.height;
+  if (out_stride) *out_stride = fmt.fmt.pix.bytesperline;
+  if (out_pixfmt) *out_pixfmt = fmt.fmt.pix.pixelformat;
+  return 0;
+}
+static int v4l2_set_fmt_capture(int fd, uint32_t pixfmt, uint32_t w, uint32_t h, uint32_t *out_w, uint32_t *out_h, uint32_t *out_stride) {
+  struct v4l2_format fmt;
+  memset(&fmt, 0, sizeof(fmt));
+  fmt.type = V4L2_BUF_TYPE_VIDEO_CAPTURE;
+  if (xioctl(fd, VIDIOC_G_FMT, &fmt) < 0) return -1;
+  fmt.fmt.pix.pixelformat = pixfmt;
+  if (w) fmt.fmt.pix.width = w;
+  if (h) fmt.fmt.pix.height = h;
+  fmt.fmt.pix.field = V4L2_FIELD_NONE;
+  if (xioctl(fd, VIDIOC_S_FMT, &fmt) < 0) return -1;
+  if (out_w) *out_w = fmt.fmt.pix.width;
+  if (out_h) *out_h = fmt.fmt.pix.height;
+  if (out_stride) *out_stride = fmt.fmt.pix.bytesperline;
+  return 0;
+}
+static int tc358743_set_pixfmt_rgb24(int fd, uint32_t *out_w, uint32_t *out_h, uint32_t *out_stride) {
+  return v4l2_set_fmt_capture(fd, V4L2_PIX_FMT_RGB24, 0, 0, out_w, out_h, out_stride);
+}
+static int v4l2_start_mmap_capture(int fd, struct cap_buf **out_bufs, uint32_t *out_nbufs) {
+  struct v4l2_requestbuffers req;
+  memset(&req, 0, sizeof(req));
+  req.count = 3;
+  req.type = V4L2_BUF_TYPE_VIDEO_CAPTURE;
+  req.memory = V4L2_MEMORY_MMAP;
+  if (xioctl(fd, VIDIOC_REQBUFS, &req) < 0) {
+    fprintf(stderr, "[v4l2] VIDIOC_REQBUFS failed: %s\n", strerror(errno));
+    return -1;
+  }
+  if (req.count < 2) return -1;
+  struct cap_buf *bufs = (struct cap_buf*)calloc(req.count, sizeof(*bufs));
+  if (!bufs) return -1;
+  for (uint32_t i=0;i<req.count;i++) {
+    struct v4l2_buffer b;
+    memset(&b, 0, sizeof(b));
+    b.type = V4L2_BUF_TYPE_VIDEO_CAPTURE;
+    b.memory = V4L2_MEMORY_MMAP;
+    b.index = i;
+    if (xioctl(fd, VIDIOC_QUERYBUF, &b) < 0) die("VIDIOC_QUERYBUF");
+    bufs[i].length = b.length;
+    bufs[i].start = mmap(NULL, b.length, PROT_READ | PROT_WRITE, MAP_SHARED, fd, b.m.offset);
+    if (bufs[i].start == MAP_FAILED) die("mmap(v4l2)");
+    if (xioctl(fd, VIDIOC_QBUF, &b) < 0) die("VIDIOC_QBUF");
+  }
+  enum v4l2_buf_type type = V4L2_BUF_TYPE_VIDEO_CAPTURE;
+  if (xioctl(fd, VIDIOC_STREAMON, &type) < 0) die("VIDIOC_STREAMON");
+  *out_bufs = bufs;
+  *out_nbufs = req.count;
+  return 0;
+}
+static void v4l2_stop_and_unmap(int fd, struct cap_buf *cbufs, uint32_t cbuf_count) {
+  if (fd >= 0) {
+    enum v4l2_buf_type type = V4L2_BUF_TYPE_VIDEO_CAPTURE;
+    (void)xioctl(fd, VIDIOC_STREAMOFF, &type);
+  }
+  for (uint32_t i=0;i<cbuf_count;i++) {
+    if (cbufs && cbufs[i].start && cbufs[i].length) munmap(cbufs[i].start, cbufs[i].length);
+  }
+  free(cbufs);
+}
+static int v4l2_wait_for_frame(int fd, int timeout_ms) {
+  struct pollfd pfd;
+  memset(&pfd, 0, sizeof(pfd));
+  pfd.fd = fd;
+  pfd.events = POLLIN;
+  int r = poll(&pfd, 1, timeout_ms);
+  if (r < 0) {
+    if (errno == EINTR) return 1;
+    return -1;
+  }
+  if (r == 0) return 0;
+  return 1;
+}
+static int v4l2_dequeue_frame(int fd, struct v4l2_buffer *out_b) {
+  struct v4l2_buffer b;
+  memset(&b, 0, sizeof(b));
+  b.type = V4L2_BUF_TYPE_VIDEO_CAPTURE;
+  b.memory = V4L2_MEMORY_MMAP;
+  if (xioctl(fd, VIDIOC_DQBUF, &b) < 0) {
+    if (errno == EAGAIN) return 1;
+    return -1;
+  }
+  *out_b = b;
+  return 0;
+}
+static int v4l2_queue_frame(int fd, struct v4l2_buffer *b) {
+  if (xioctl(fd, VIDIOC_QBUF, b) < 0) return -1;
+  return 0;
+}
+static int v4l2_dequeue_latest_frame(int fd, struct v4l2_buffer *out_b) {
+  struct v4l2_buffer newest;
+  bool have=false;
+  for (;;) {
+    struct v4l2_buffer b;
+    int rc = v4l2_dequeue_frame(fd, &b);
+    if (rc == 0) {
+      if (have) (void)v4l2_queue_frame(fd, &newest);
+      newest = b;
+      have = true;
+      continue;
+    }
+    if (rc == 1) break;
+    return -1;
+  }
+  if (!have) return 1;
+  *out_b = newest;
+  return 0;
+}
+
+// ---- Multi-source probing helpers (keep old behavior) ----
+struct source_probe {
+  bool present = false;
+  bool active = false;
+  uint32_t dv_w = 0, dv_h = 0;
+  uint64_t pixelclock = 0;
+  uint32_t fmt_w = 0, fmt_h = 0;
+  uint32_t stride = 0;
+  uint32_t pixfmt = 0;
+  std::string err;
+};
+static source_probe probe_v4l2_source(const std::string &dev) {
+  source_probe p{};
+  int fd = v4l2_open(dev.c_str(), O_RDWR | O_NONBLOCK, 0);
+  if (fd < 0) {
+    p.present = false;
+    p.active = false;
+    p.err = std::string("open failed: ") + strerror(errno);
+    return p;
+  }
+  p.present = true;
+  uint32_t tw=0, th=0; uint64_t pc=0;
+  if (tc358743_query_dv_timings(fd, &tw, &th, &pc) == 0 && tw > 0 && th > 0) {
+    p.active = true;
+    p.dv_w = tw;
+    p.dv_h = th;
+    p.pixelclock = pc;
+  } else {
+    p.active = true;
+  }
+  uint32_t fw=0, fh=0, st=0, pf=0;
+  if (v4l2_get_current_fmt(fd, &fw, &fh, &st, &pf) == 0) {
+    p.fmt_w = fw;
+    p.fmt_h = fh;
+    p.stride = st;
+    p.pixfmt = pf;
+  }
+  v4l2_close(fd);
+  return p;
+}
+
+// ---------------- DRM scanout helpers ----------------
+// (Kept inline here; unchanged from your code)
+struct dumb_fb {
+  uint32_t fb_id;
+  uint32_t handle;
+  uint32_t pitch;
+  uint64_t size;
+  void *map;
+  uint32_t width, height;
+  uint32_t format;
+};
+static int dumb_fb_create(int drm_fd, uint32_t w, uint32_t h, uint32_t format, struct dumb_fb *out) {
+  memset(out, 0, sizeof(*out));
+  out->width = w; out->height = h; out->format = format;
+  struct drm_mode_create_dumb creq;
+  memset(&creq, 0, sizeof(creq));
+  creq.width = w; creq.height = h; creq.bpp = 32;
+  if (drmIoctl(drm_fd, DRM_IOCTL_MODE_CREATE_DUMB, &creq) < 0) return -1;
+  out->handle = creq.handle;
+  out->pitch = creq.pitch;
+  out->size = creq.size;
+  uint32_t handles[4] = { out->handle, 0, 0, 0 };
+  uint32_t pitches[4] = { out->pitch, 0, 0, 0 };
+  uint32_t offsets[4] = { 0, 0, 0, 0 };
+  int ret = drmModeAddFB2(drm_fd, w, h, format, handles, pitches, offsets, &out->fb_id, 0);
+  if (ret) {
+    ret = drmModeAddFB(drm_fd, w, h, 24, 32, out->pitch, out->handle, &out->fb_id);
+    if (ret) return -1;
+  }
+  struct drm_mode_map_dumb mreq;
+  memset(&mreq, 0, sizeof(mreq));
+  mreq.handle = out->handle;
+  if (drmIoctl(drm_fd, DRM_IOCTL_MODE_MAP_DUMB, &mreq) < 0) return -1;
+  out->map = mmap(0, out->size, PROT_READ | PROT_WRITE, MAP_SHARED, drm_fd, mreq.offset);
+  if (out->map == MAP_FAILED) { out->map=NULL; return -1; }
+  memset(out->map, 0, out->size);
+  return 0;
+}
+static void dumb_fb_destroy(int drm_fd, struct dumb_fb *fb) {
+  if (!fb) return;
+  if (fb->map) munmap(fb->map, fb->size);
+  if (fb->fb_id) drmModeRmFB(drm_fd, fb->fb_id);
+  if (fb->handle) {
+    struct drm_mode_destroy_dumb dreq;
+    memset(&dreq, 0, sizeof(dreq));
+    dreq.handle = fb->handle;
+    drmIoctl(drm_fd, DRM_IOCTL_MODE_DESTROY_DUMB, &dreq);
+  }
+  memset(fb, 0, sizeof(*fb));
+}
+static uint32_t get_prop_id(int drm_fd, uint32_t obj_id, uint32_t obj_type, const char *name) {
+  drmModeObjectProperties *props = drmModeObjectGetProperties(drm_fd, obj_id, obj_type);
+  if (!props) return 0;
+  uint32_t prop_id = 0;
+  for (uint32_t i=0;i<props->count_props;i++) {
+    drmModePropertyRes *p = drmModeGetProperty(drm_fd, props->props[i]);
+    if (p) {
+      if (strcmp(p->name, name) == 0) { prop_id = p->prop_id; drmModeFreeProperty(p); break; }
+      drmModeFreeProperty(p);
+    }
+  }
+  drmModeFreeObjectProperties(props);
+  return prop_id;
+}
+static int open_vc4_card(void) {
+  int fd = open("/dev/dri/card1", O_RDWR | O_CLOEXEC);
+  if (fd >= 0) return fd;
+  return open("/dev/dri/card0", O_RDWR | O_CLOEXEC);
+}
+static bool plane_supports_format(drmModePlane *p, uint32_t fmt) {
+  for (uint32_t i=0;i<p->count_formats;i++) if (p->formats[i] == fmt) return true;
+  return false;
+}
+static uint64_t get_plane_prop_value_u64(int drm_fd, uint32_t plane_id, uint32_t prop_id, bool *ok) {
+  *ok=false;
+  drmModeObjectProperties *props = drmModeObjectGetProperties(drm_fd, plane_id, DRM_MODE_OBJECT_PLANE);
+  if (!props) return 0;
+  uint64_t val=0;
+  for (uint32_t i=0;i<props->count_props;i++) {
+    if (props->props[i] == prop_id) { val = props->prop_values[i]; *ok=true; break; }
+  }
+  drmModeFreeObjectProperties(props);
+  return val;
+}
+static uint32_t find_primary_plane_on_crtc(int drm_fd, uint32_t crtc_index, uint32_t format) {
+  drmModePlaneRes *pres = drmModeGetPlaneResources(drm_fd);
+  if (!pres) return 0;
+  for (uint32_t i=0;i<pres->count_planes;i++) {
+    drmModePlane *p = drmModeGetPlane(drm_fd, pres->planes[i]);
+    if (!p) continue;
+    if (!(p->possible_crtcs & (1u<<crtc_index))) { drmModeFreePlane(p); continue; }
+    if (!plane_supports_format(p, format)) { drmModeFreePlane(p); continue; }
+    uint32_t type_prop = get_prop_id(drm_fd, p->plane_id, DRM_MODE_OBJECT_PLANE, "type");
+    if (type_prop) {
+      bool ok=false;
+      uint64_t type_val = get_plane_prop_value_u64(drm_fd, p->plane_id, type_prop, &ok);
+      if (ok && type_val == 1) {
+        uint32_t id = p->plane_id;
+        drmModeFreePlane(p);
+        drmModeFreePlaneResources(pres);
+        return id;
+      }
+    }
+    drmModeFreePlane(p);
+  }
+  drmModeFreePlaneResources(pres);
+  return 0;
+}
+static int find_hdmi_a_1(int drm_fd, uint32_t *out_conn_id, drmModeConnector **out_conn) {
+  drmModeRes *res = drmModeGetResources(drm_fd);
+  if (!res) return -1;
+  for (int i=0;i<res->count_connectors;i++) {
+    drmModeConnector *c = drmModeGetConnector(drm_fd, res->connectors[i]);
+    if (!c) continue;
+    if (c->connector_type == DRM_MODE_CONNECTOR_HDMIA && c->connector_type_id == 1) {
+      *out_conn_id = c->connector_id;
+      *out_conn = c;
+      drmModeFreeResources(res);
+      return 0;
+    }
+    drmModeFreeConnector(c);
+  }
+  drmModeFreeResources(res);
+  return -1;
+}
+static int get_active_crtc_for_connector(int drm_fd, drmModeConnector *conn,
+                                         uint32_t *out_crtc_id, uint32_t *out_crtc_index,
+                                         uint32_t *out_w, uint32_t *out_h) {
+  drmModeRes *res = drmModeGetResources(drm_fd);
+  if (!res) return -1;
+  if (!conn->encoder_id) { drmModeFreeResources(res); return -1; }
+  drmModeEncoder *enc = drmModeGetEncoder(drm_fd, conn->encoder_id);
+  if (!enc) { drmModeFreeResources(res); return -1; }
+  uint32_t chosen_crtc=0, chosen_index=0;
+  uint32_t chosen_w=0, chosen_h=0;
+  for (int i=0;i<res->count_crtcs;i++) {
+    if (!(enc->possible_crtcs & (1<<i))) continue;
+    uint32_t cid = res->crtcs[i];
+    drmModeCrtc *crtc = drmModeGetCrtc(drm_fd, cid);
+    if (!crtc) continue;
+    if (crtc->mode_valid && crtc->mode.hdisplay>0 && crtc->mode.vdisplay>0) {
+      chosen_crtc=cid; chosen_index=(uint32_t)i;
+      chosen_w=(uint32_t)crtc->mode.hdisplay; chosen_h=(uint32_t)crtc->mode.vdisplay;
+      drmModeFreeCrtc(crtc);
+      break;
+    }
+    drmModeFreeCrtc(crtc);
+    if (!chosen_crtc) { chosen_crtc=cid; chosen_index=(uint32_t)i; }
+  }
+  drmModeFreeEncoder(enc);
+  drmModeFreeResources(res);
+  if (!chosen_crtc || chosen_w==0 || chosen_h==0) return -1;
+  *out_crtc_id=chosen_crtc; *out_crtc_index=chosen_index; *out_w=chosen_w; *out_h=chosen_h;
+  return 0;
+}
+static bool connector_find_mode(drmModeConnector *conn, uint32_t w, uint32_t h, double vrefresh_hz, drmModeModeInfo *out_mode) {
+  if (!conn || conn->count_modes <= 0) return false;
+  for (int i=0;i<conn->count_modes;i++) {
+    drmModeModeInfo m = conn->modes[i];
+    if ((uint32_t)m.hdisplay != w || (uint32_t)m.vdisplay != h) continue;
+    double refresh = 0.0;
+    if (m.htotal>0 && m.vtotal>0) refresh = (double)m.clock*1000.0 / ((double)m.htotal*(double)m.vtotal);
+    if (vrefresh_hz > 0.0) {
+      if (refresh > (vrefresh_hz - 1.0) && refresh < (vrefresh_hz + 1.0)) { *out_mode = m; return true; }
+    } else { *out_mode = m; return true; }
+  }
+  return false;
+}
+static int drm_modeset_match_input(int drm_fd, uint32_t conn_id, drmModeConnector *conn, uint32_t crtc_id,
+                                   uint32_t want_w, uint32_t want_h) {
+  drmModeModeInfo chosen;
+  memset(&chosen, 0, sizeof(chosen));
+  if (!connector_find_mode(conn, want_w, want_h, 60.0, &chosen) &&
+      !connector_find_mode(conn, want_w, want_h, -1.0, &chosen)) {
+    fprintf(stderr, "[modeset] No connector mode for %ux%u\n", want_w, want_h);
+    return -1;
+  }
+  uint32_t mode_blob=0;
+  if (drmModeCreatePropertyBlob(drm_fd, &chosen, sizeof(chosen), &mode_blob) != 0) return -1;
+  uint32_t conn_crtc_id_prop = get_prop_id(drm_fd, conn_id, DRM_MODE_OBJECT_CONNECTOR, "CRTC_ID");
+  uint32_t crtc_mode_id_prop = get_prop_id(drm_fd, crtc_id, DRM_MODE_OBJECT_CRTC, "MODE_ID");
+  uint32_t crtc_active_prop  = get_prop_id(drm_fd, crtc_id, DRM_MODE_OBJECT_CRTC, "ACTIVE");
+  drmModeAtomicReq *req = drmModeAtomicAlloc();
+  if (!req) die("drmModeAtomicAlloc");
+  drmModeAtomicAddProperty(req, conn_id, conn_crtc_id_prop, crtc_id);
+  drmModeAtomicAddProperty(req, crtc_id, crtc_mode_id_prop, mode_blob);
+  drmModeAtomicAddProperty(req, crtc_id, crtc_active_prop, 1);
+  int ret = drmModeAtomicCommit(drm_fd, req, DRM_MODE_ATOMIC_ALLOW_MODESET, NULL);
+  drmModeAtomicFree(req);
+  drmModeDestroyPropertyBlob(drm_fd, mode_blob);
+  return ret;
+}
+static int drm_modeset_prefer(int drm_fd, uint32_t conn_id, drmModeConnector *conn, uint32_t crtc_id,
+                             uint32_t prefer_w, uint32_t prefer_h, double prefer_hz) {
+  drmModeModeInfo chosen;
+  memset(&chosen, 0, sizeof(chosen));
+  if (!connector_find_mode(conn, prefer_w, prefer_h, prefer_hz, &chosen) &&
+      !connector_find_mode(conn, prefer_w, prefer_h, -1.0, &chosen)) {
+    fprintf(stderr, "[modeset] preferred mode %ux%u not available\n", prefer_w, prefer_h);
+    return 0;
+  }
+  uint32_t mode_blob=0;
+  if (drmModeCreatePropertyBlob(drm_fd, &chosen, sizeof(chosen), &mode_blob) != 0) return -1;
+  uint32_t conn_crtc_id_prop = get_prop_id(drm_fd, conn_id, DRM_MODE_OBJECT_CONNECTOR, "CRTC_ID");
+  uint32_t crtc_mode_id_prop = get_prop_id(drm_fd, crtc_id, DRM_MODE_OBJECT_CRTC, "MODE_ID");
+  uint32_t crtc_active_prop  = get_prop_id(drm_fd, crtc_id, DRM_MODE_OBJECT_CRTC, "ACTIVE");
+  drmModeAtomicReq *req = drmModeAtomicAlloc();
+  if (!req) die("drmModeAtomicAlloc");
+  drmModeAtomicAddProperty(req, conn_id, conn_crtc_id_prop, crtc_id);
+  drmModeAtomicAddProperty(req, crtc_id, crtc_mode_id_prop, mode_blob);
+  drmModeAtomicAddProperty(req, crtc_id, crtc_active_prop, 1);
+  int ret = drmModeAtomicCommit(drm_fd, req, DRM_MODE_ATOMIC_ALLOW_MODESET, NULL);
+  drmModeAtomicFree(req);
+  drmModeDestroyPropertyBlob(drm_fd, mode_blob);
+  return ret;
+}
+
+// ---- chunk 1 ends here ----
+// Next chunk will continue with present rect helpers, compositor LUTs, filters,
+// source_capture, compositor threadpool, pipeline, and webui glue.
+// ---------------- Present rectangle ----------------
+struct present_rect {
+  int32_t crtc_x, crtc_y;
+  uint32_t crtc_w, crtc_h;
+  uint32_t src_w, src_h;
+};
+static present_rect compute_present_rect(const char *policy, uint32_t out_w, uint32_t out_h, uint32_t in_w, uint32_t in_h) {
+  present_rect r; memset(&r, 0, sizeof(r));
+  r.src_w=in_w; r.src_h=in_h;
+  if (strcmp(policy, "stretch")==0) { r.crtc_x=0;r.crtc_y=0;r.crtc_w=out_w;r.crtc_h=out_h; return r; }
+  if (strcmp(policy, "1:1")==0) {
+    r.crtc_w=in_w; r.crtc_h=in_h;
+    r.crtc_x=(int32_t)((int)out_w-(int)r.crtc_w)/2;
+    r.crtc_y=(int32_t)((int)out_h-(int)r.crtc_h)/2;
+    return r;
+  }
+  double sx = in_w ? ((double)out_w/(double)in_w) : 1.0;
+  double sy = in_h ? ((double)out_h/(double)in_h) : 1.0;
+  double s = (sx<sy)?sx:sy;
+  if (s<=0.0) s=1.0;
+  uint32_t w=(uint32_t)((double)in_w*s + 0.5);
+  uint32_t h=(uint32_t)((double)in_h*s + 0.5);
+  if (w>out_w) w=out_w;
+  if (h>out_h) h=out_h;
+  r.crtc_w=w; r.crtc_h=h;
+  r.crtc_x=(int32_t)((int)out_w-(int)w)/2;
+  r.crtc_y=(int32_t)((int)out_h-(int)h)/2;
+  return r;
+}
+
+static int drm_commit_plane_present(
+  int drm_fd,
+  uint32_t plane_id, uint32_t crtc_id,
+  uint32_t prop_fb_id, uint32_t prop_crtc_id,
+  uint32_t prop_crtc_x, uint32_t prop_crtc_y, uint32_t prop_crtc_w, uint32_t prop_crtc_h,
+  uint32_t prop_src_x, uint32_t prop_src_y, uint32_t prop_src_w, uint32_t prop_src_h,
+  uint32_t fb_id_to_use,
+  const present_rect *pr
+) {
+  drmModeAtomicReq *req = drmModeAtomicAlloc();
+  if (!req) die("drmModeAtomicAlloc");
+  drmModeAtomicAddProperty(req, plane_id, prop_fb_id, fb_id_to_use);
+  drmModeAtomicAddProperty(req, plane_id, prop_crtc_id, crtc_id);
+  drmModeAtomicAddProperty(req, plane_id, prop_crtc_x, (uint32_t)pr->crtc_x);
+  drmModeAtomicAddProperty(req, plane_id, prop_crtc_y, (uint32_t)pr->crtc_y);
+  drmModeAtomicAddProperty(req, plane_id, prop_crtc_w, pr->crtc_w);
+  drmModeAtomicAddProperty(req, plane_id, prop_crtc_h, pr->crtc_h);
+  drmModeAtomicAddProperty(req, plane_id, prop_src_x, 0<<16);
+  drmModeAtomicAddProperty(req, plane_id, prop_src_y, 0<<16);
+  drmModeAtomicAddProperty(req, plane_id, prop_src_w, pr->src_w<<16);
+  drmModeAtomicAddProperty(req, plane_id, prop_src_h, pr->src_h<<16);
+  int ret = drmModeAtomicCommit(drm_fd, req, 0, NULL);
+  drmModeAtomicFree(req);
+  return ret;
+}
+static int drm_plane_flip_fb_only(int drm_fd, uint32_t plane_id, uint32_t prop_fb_id, uint32_t fb_id) {
+  drmModeAtomicReq *req = drmModeAtomicAlloc();
+  if (!req) return -1;
+  drmModeAtomicAddProperty(req, plane_id, prop_fb_id, fb_id);
+  int ret = drmModeAtomicCommit(drm_fd, req, 0, NULL);
+  drmModeAtomicFree(req);
+  return ret;
+}
+
+// ---------------- Compositor essentials (use XRGB sources) ----------------
+static inline uint32_t invert_xrgb8888(uint32_t xrgb) {
+  return (xrgb & 0xFF000000u) | ((xrgb ^ 0x00FFFFFFu) & 0x00FFFFFFu);
+}
+static inline uint32_t blend_over_xrgb(uint32_t under, uint32_t over, uint8_t a) {
+  if (a==0) return under;
+  if (a==255) return over;
+  uint32_t ur=(under>>16)&0xFF, ug=(under>>8)&0xFF, ub=under&0xFF;
+  uint32_t orr=(over>>16)&0xFF, og=(over>>8)&0xFF, ob=over&0xFF;
+  uint32_t rr=(orr*a + ur*(255-a) + 127)/255;
+  uint32_t gg=(og*a  + ug*(255-a) + 127)/255;
+  uint32_t bb=(ob*a  + ub*(255-a) + 127)/255;
+  return 0xFF000000u | (rr<<16) | (gg<<8) | bb;
+}
+
+struct rect_i32 { int32_t x0=0, y0=0, x1=0, y1=0; };
+static inline rect_i32 rect_intersect(const rect_i32 &a, const rect_i32 &b) {
+  rect_i32 r;
+  r.x0 = std::max(a.x0, b.x0);
+  r.y0 = std::max(a.y0, b.y0);
+  r.x1 = std::min(a.x1, b.x1);
+  r.y1 = std::min(a.y1, b.y1);
+  if (r.x1 < r.x0) r.x1 = r.x0;
+  if (r.y1 < r.y0) r.y1 = r.y0;
+  return r;
+}
+static inline bool rect_empty(const rect_i32 &r) {
+  return (r.x0 >= r.x1) || (r.y0 >= r.y1);
+}
+static inline int32_t map_vx_to_ox(const present_rect &pr, uint32_t vpw, int32_t vx) {
+  return pr.crtc_x + (int32_t)(((int64_t)vx * (int64_t)pr.crtc_w) / (int64_t)vpw);
+}
+static inline int32_t map_vy_to_oy(const present_rect &pr, uint32_t vph, int32_t vy) {
+  return pr.crtc_y + (int32_t)(((int64_t)vy * (int64_t)pr.crtc_h) / (int64_t)vph);
+}
+static inline rect_i32 layer_vp_rect_to_output_bounds(
+  const present_rect &pr, uint32_t vpw, uint32_t vph,
+  int32_t layer_vp_x0, int32_t layer_vp_y0, int32_t layer_vp_w,  int32_t layer_vp_h
+) {
+  rect_i32 r{0,0,0,0};
+  if (vpw == 0 || vph == 0) return r;
+  if (pr.crtc_w == 0 || pr.crtc_h == 0) return r;
+  if (layer_vp_w <= 0 || layer_vp_h <= 0) return r;
+  int32_t ox0 = map_vx_to_ox(pr, vpw, layer_vp_x0);
+  int32_t ox1 = map_vx_to_ox(pr, vpw, layer_vp_x0 + layer_vp_w);
+  int32_t oy0 = map_vy_to_oy(pr, vph, layer_vp_y0);
+  int32_t oy1 = map_vy_to_oy(pr, vph, layer_vp_y0 + layer_vp_h);
+  if (ox1 < ox0) std::swap(ox0, ox1);
+  if (oy1 < oy0) std::swap(oy0, oy1);
+  ox0 -= 1; oy0 -= 1;
+  ox1 += 1; oy1 += 1;
+  r.x0 = ox0; r.y0 = oy0; r.x1 = ox1; r.y1 = oy1;
+  return r;
+}
+static inline rect_i32 clamp_bounds_to_output_and_band(const rect_i32 &r, uint32_t out_w, uint32_t out_h, uint32_t y0, uint32_t y1) {
+  rect_i32 out = r;
+  rect_i32 out_full{0,0,(int32_t)out_w,(int32_t)out_h};
+  rect_i32 band{0,(int32_t)y0,(int32_t)out_w,(int32_t)y1};
+  out = rect_intersect(out, out_full);
+  out = rect_intersect(out, band);
+  return out;
+}
+
+struct out_to_vp_lut {
+  uint32_t out_w=0, out_h=0;
+  uint32_t vpw=0, vph=0;
+  present_rect pr{};
+  std::vector<int32_t> ox_to_vx;
+  std::vector<int32_t> oy_to_vy;
+
+  void rebuild(uint32_t outW, uint32_t outH, uint32_t vpW, uint32_t vpH, const present_rect &p) {
+    out_w=outW; out_h=outH; vpw=vpW; vph=vpH; pr=p;
+    ox_to_vx.assign(out_w, -1);
+    oy_to_vy.assign(out_h, -1);
+    if (pr.crtc_w == 0 || pr.crtc_h == 0 || vpw == 0 || vph == 0) return;
+
+    for (uint32_t ox=0; ox<out_w; ox++) {
+      int32_t tx = (int32_t)ox - pr.crtc_x;
+      if (tx < 0 || tx >= (int32_t)pr.crtc_w) continue;
+      int32_t vx = (int32_t)(((int64_t)tx * (int64_t)vpw) / (int64_t)pr.crtc_w);
+      if (vx < 0 || vx >= (int32_t)vpw) continue;
+      ox_to_vx[ox] = vx;
+    }
+    for (uint32_t oy=0; oy<out_h; oy++) {
+      int32_t ty = (int32_t)oy - pr.crtc_y;
+      if (ty < 0 || ty >= (int32_t)pr.crtc_h) continue;
+      int32_t vy = (int32_t)(((int64_t)ty * (int64_t)vph) / (int64_t)pr.crtc_h);
+      if (vy < 0 || vy >= (int32_t)vph) continue;
+      oy_to_vy[oy] = vy;
+    }
+  }
+};
+
+struct layer_map_cache {
+  rect_u32 sr{};
+  int32_t dst_x=0, dst_y=0;
+  int32_t vp_w=0, vp_h=0;
+  uint8_t alpha=255;
+  layer_invert_rel inv=INV_NONE;
+  bool enabled=false;
+  std::vector<uint16_t> x_map;
+  std::vector<uint16_t> y_map;
+
+  void build_from_layer(const layer_cfg &L, uint32_t in_w, uint32_t in_h) {
+    enabled=false;
+    x_map.clear(); y_map.clear();
+    if (!L.enabled || L.type != LAYER_VIDEO) return;
+    rect_u32 s = L.src_rect;
+    if (s.w==0 || s.h==0) return;
+    if (s.x >= in_w || s.y >= in_h) return;
+    if (s.x + s.w > in_w) s.w = in_w - s.x;
+    if (s.y + s.h > in_h) s.h = in_h - s.y;
+    if (s.w==0 || s.h==0) return;
+    float sx = L.scale_x, sy = L.scale_y;
+    if (!(sx > 0.0001f && sy > 0.0001f)) return;
+
+    sr=s;
+    dst_x=L.dst_pos.x; dst_y=L.dst_pos.y;
+    vp_w=(int32_t)std::max(1.0f, std::floor((float)sr.w * sx + 0.5f));
+    vp_h=(int32_t)std::max(1.0f, std::floor((float)sr.h * sy + 0.5f));
+    alpha=(uint8_t)std::lround(std::clamp(L.opacity,0.0f,1.0f)*255.0f);
+    inv=L.invert_rel;
+    if (alpha==0) return;
+
+    x_map.resize((size_t)vp_w);
+    y_map.resize((size_t)vp_h);
+
+    for (int32_t vx=0; vx<vp_w; vx++) {
+      uint32_t sxi = (uint32_t)(((uint64_t)(uint32_t)vx * (uint64_t)sr.w) / (uint64_t)vp_w);
+      if (sxi >= sr.w) sxi = sr.w-1;
+      x_map[(size_t)vx] = (uint16_t)sxi;
+    }
+    for (int32_t vy=0; vy<vp_h; vy++) {
+      uint32_t syi = (uint32_t)(((uint64_t)(uint32_t)vy * (uint64_t)sr.h) / (uint64_t)vp_h);
+      if (syi >= sr.h) syi = sr.h-1;
+      y_map[(size_t)vy] = (uint16_t)syi;
+    }
+    enabled=true;
+  }
+};
+
+static inline void clear_xrgb_rows_fast(uint8_t *dst_xrgb, uint32_t dst_stride, uint32_t out_w, uint32_t y0, uint32_t y1) {
+  for (uint32_t y=y0;y<y1;y++) {
+    uint32_t *d = (uint32_t*)(dst_xrgb + (uint64_t)y*dst_stride);
+    for (uint32_t x=0; x<out_w; x++) d[x] = 0xFF000000u;
+  }
+}
+
+// ---------------- Minimal filters + OAK bridge helpers ----------------
+struct layer_buf {
+  uint32_t w=0, h=0;
+  std::vector<uint32_t> px;
+  void resize(uint32_t W, uint32_t H) {
+    w=W; h=H;
+    px.resize((size_t)w*(size_t)h);
+  }
+};
+
+static inline uint8_t luma_u8_from_xrgb(uint32_t p) {
+  uint32_t r=(p>>16)&0xFF, g=(p>>8)&0xFF, b=p&0xFF;
+  return (uint8_t)((r*77 + g*150 + b*29 + 128) >> 8);
+}
+
+// ---- IMPORTANT ----
+// From here down, chunk 3 will include:
+//   - your full filter implementations (unchanged) OR continue from your existing file
+//   - source_capture, runtime status, compositor job/worker pool
+//   - OAK integration hook in composite_video_filtered_rows
+// We will not remove or stub anything. We'll keep your original functions intact.
+// ---- chunk 2 ends here ----

@@ -452,6 +452,27 @@ static const char *kIndexHtml = R"HTML(<!doctype html>
             </div>
             <div style="height:10px;"></div>
             <div id="filtersBox" class="fStack"></div>
+<div class="hr"></div>
+<div class="sectionTitle">OAK</div>
+<div class="help">
+  Optional: mark this layer as an OAK input (visible/thermal) or show OAK output.
+  (Backend currently expects the layer-space size to match oakW×oakH.)
+</div>
+<div style="height:8px;"></div>
+<div class="grid2">
+  <div>
+    <label><input id="iOakEnabled" type="checkbox"/> OAK enabled</label>
+  </div>
+  <div>
+    <label>OAK role</label>
+    <select id="iOakRole">
+      <option value="none">none</option>
+      <option value="visible">visible</option>
+      <option value="thermal">thermal</option>
+      <option value="output">output</option>
+    </select>
+  </div>
+</div>
           </div>
           <div id="crossInspector" style="display:none;">
             <div class="sectionTitle">Crosshair layer</div>
@@ -777,6 +798,15 @@ function ensureLayerDefaults(L){
   if (L.type === 'video') {
     if (L.videoSource === undefined) L.videoSource = "";
     if (typeof L.videoSource !== 'string') L.videoSource = String(L.videoSource ?? "");
+  }
+  // OAK per-layer defaults (video layers only)
+  if (L.type === 'video') {
+    if (L.oakEnabled === undefined) L.oakEnabled = false;
+    if (!L.oakRole) L.oakRole = "none";
+    if (!["none","visible","thermal","output"].includes(L.oakRole)) L.oakRole = "none";
+  } else {
+    L.oakEnabled = false;
+    L.oakRole = "none";
   }
   if (!L.srcRect || !parseRect(L.srcRect)) L.srcRect = "0,0,1,1";
   if (!L.dstPos  || !parsePos(L.dstPos))   L.dstPos  = "0,0";
@@ -1692,6 +1722,22 @@ function renderInspector(){
     document.getElementById('iDstPos').value = L.dstPos || '0,0';
     document.getElementById('iScale').value = L.scale || '1.0,1.0';
     renderFiltersUIForLayer(L);
+    // OAK controls
+    const iOakEnabled = document.getElementById('iOakEnabled');
+    const iOakRole = document.getElementById('iOakRole');
+    if (iOakEnabled && iOakRole) {
+      iOakEnabled.checked = !!L.oakEnabled;
+      iOakRole.value = L.oakRole || "none";
+
+      iOakEnabled.onchange = () => {
+        L.oakEnabled = !!iOakEnabled.checked;
+        validateCfg();
+      };
+      iOakRole.onchange = () => {
+        L.oakRole = String(iOakRole.value || "none");
+        validateCfg();
+      };
+    }
   }
 }
 function validateCfg(){
@@ -1702,6 +1748,9 @@ function validateCfg(){
     ensureLayerDefaults(L);
     if (L.type === 'video') {
       if (L.videoSource !== undefined && typeof L.videoSource !== 'string') errors.push(`layer ${idx}: videoSource must be string`);
+      if (L.oakEnabled && L.oakRole === "none") {
+        errors.push(`layer ${idx}: oakEnabled=true but oakRole=none`);
+      }
       ensureVideoFilterDefaults(L);
       L.filters.forEach((f, fi) => {
         if (!f.id || typeof f.id !== 'string') errors.push(`layer ${idx} filter ${fi}: missing id`);
@@ -1722,6 +1771,17 @@ function validateCfg(){
       });
     }
   });
+  let oakVisible = 0, oakThermal = 0, oakOutput = 0;
+  cfg.layers.forEach(L => {
+    if (L.type !== 'video') return;
+    if (!L.oakEnabled) return;
+    if (L.oakRole === "visible") oakVisible++;
+    if (L.oakRole === "thermal") oakThermal++;
+    if (L.oakRole === "output") oakOutput++;
+  });
+  if (oakVisible > 1) errors.push("multiple layers set to oakRole=visible (only one recommended)");
+  if (oakThermal > 1) errors.push("multiple layers set to oakRole=thermal (only one recommended)");
+  if (oakOutput > 1) errors.push("multiple layers set to oakRole=output (only one recommended)");
   const box = document.getElementById('validationBox');
   if (box) {
     if (errors.length === 0) {

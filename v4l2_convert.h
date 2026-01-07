@@ -87,3 +87,33 @@ static inline void convert_uyvy_to_xrgb8888(
     }
   }
 }
+
+// YU12 / I420 (planar 4:2:0): Y plane (W*H) then U plane (W*H/4) then V plane (W*H/4)
+static inline void convert_yu12_to_xrgb8888(
+  const uint8_t *src, uint32_t src_stride, // NOTE: for planar formats, drivers often set bytesperline for Y; if 0/odd, assume tight.
+  uint32_t *dst, uint32_t dst_stride_bytes,
+  uint32_t w, uint32_t h
+) {
+  // Treat src as tightly packed planar if stride is unusable; otherwise use stride for Y only.
+  // Many UVC devices provide contiguous planes with no padding; this matches your v4l2-ctl listing.
+  const uint32_t y_stride = (src_stride >= w) ? src_stride : w;
+
+  const uint8_t *Y = src;
+  const uint8_t *U = Y + (size_t)y_stride * (size_t)h;
+  const uint8_t *V = U + (size_t)(w/2) * (size_t)(h/2);
+
+  for (uint32_t y=0; y<h; y++) {
+    uint32_t *d = (uint32_t*)((uint8_t*)dst + (size_t)y * (size_t)dst_stride_bytes);
+    const uint8_t *yrow = Y + (size_t)y * (size_t)y_stride;
+    const uint8_t *urow = U + (size_t)(y/2) * (size_t)(w/2);
+    const uint8_t *vrow = V + (size_t)(y/2) * (size_t)(w/2);
+    for (uint32_t x=0; x<w; x++) {
+      int yy = yrow[x];
+      int uu = urow[x/2];
+      int vv = vrow[x/2];
+      uint8_t r,g,b;
+      yuv_to_rgb(yy, uu, vv, &r, &g, &b);
+      d[x] = pack_xrgb8888(r,g,b);
+    }
+  }
+}

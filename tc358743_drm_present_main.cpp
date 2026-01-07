@@ -39,6 +39,7 @@
 #include "overlay_backend.h"
 #include "v4l2_caps.h"
 #include "v4l2_convert.h"
+#include "oak_accel.h"
 
 using nlohmann::json;
 
@@ -752,6 +753,79 @@ struct layer_buf {
     px.resize((size_t)w*(size_t)h);
   }
 };
+
+// ---------------- OAK global state ----------------
+static std::mutex g_oak_mtx;
+static OakAccel g_oak;
+static bool g_oak_inited = false;
+static std::string g_oak_last_err;
+static uint64_t g_oak_seq = 1;
+
+// Latest output from OAK (GRAY8 oakW*oakH)
+static std::mutex g_oak_out_mtx;
+static std::vector<uint8_t> g_oak_out_gray;
+static uint64_t g_oak_out_seq = 0;
+
+static void oak_maybe_init_locked(const persisted_config& cfg) {
+  if (!cfg.oak_enable) return;
+  if (g_oak_inited) return;
+
+  std::string err;
+  if (!g_oak.init(cfg.oak_mxid, (int)cfg.oak_w, (int)cfg.oak_h, &err)) {
+    g_oak_last_err = err;
+    fprintf(stderr, "[oak] init failed: %s\n", err.c_str());
+    g_oak_inited = false;
+    return;
+  }
+  g_oak_inited = true;
+  g_oak_last_err.clear();
+  fprintf(stderr, "[oak] initialized w=%u h=%u mxid='%s'\n",
+          cfg.oak_w, cfg.oak_h, cfg.oak_mxid.c_str());
+}
+
+static void oak_shutdown_locked() {
+  if (!g_oak_inited) return;
+  g_oak.shutdown();
+  g_oak_inited = false;
+  g_oak_last_err.clear();
+  {
+    std::lock_guard<std::mutex> lk(g_oak_out_mtx);
+    g_oak_out_gray.clear();
+    g_oak_out_seq = 0;
+  }
+}
+
+static bool cfg_wants_oak_pipeline(const persisted_config& cfg) {
+  if (!cfg.oak_enable) return false;
+  for (const auto& L : cfg.layers) {
+    if (!L.enabled) continue;
+    if (!L.oak.enabled) continue;
+    if (L.oak.role != OAK_NONE) return true; // includes OUTPUT and inputs
+  }
+  return false;
+}
+
+// Convert layer_buf (XRGB8888) -> GRAY8 (luma)
+static inline uint8_t luma_u8_from_xrgb_local(uint32_t p) {
+  uint32_t r=(p>>16)&0xFF, g=(p>>8)&0xFF, b=p&0xFF;
+  return (uint8_t)((r*77 + g*150 + b*29 + 128) >> 8);
+}
+
+static bool layerbuf_to_gray8(const layer_buf& buf, std::vector<uint8_t>& outGray) {
+  if (buf.w == 0 || buf.h == 0 || buf.px.empty()) return false;
+  outGray.resize((size_t)buf.w * (size_t)buf.h);
+  for (size_t i=0; i<buf.px.size(); i++) outGray[i] = luma_u8_from_xrgb_local(buf.px[i]);
+  return true;
+}
+
+static void gray8_to_layerbuf_xrgb(const std::vector<uint8_t>& g, uint32_t w, uint32_t h, layer_buf& outBuf) {
+  outBuf.resize(w, h);
+  for (size_t i=0; i<outBuf.px.size(); i++) {
+    uint8_t v = g[i];
+    outBuf.px[i] = 0xFF000000u | ((uint32_t)v<<16) | ((uint32_t)v<<8) | (uint32_t)v;
+  }
+}
+
 static inline uint8_t luma_u8_from_xrgb(uint32_t p) {
   uint32_t r=(p>>16)&0xFF, g=(p>>8)&0xFF, b=p&0xFF;
   return (uint8_t)((r*77 + g*150 + b*29 + 128) >> 8);
@@ -1897,6 +1971,7 @@ struct source_capture {
       V4L2_PIX_FMT_RGB24,
       V4L2_PIX_FMT_YUYV,
       V4L2_PIX_FMT_UYVY,
+      V4L2_PIX_FMT_YUV420, // 'YU12' planar 4:2:0
     };
     for (uint32_t p : prefer) {
       for (auto &f : caps.formats) if (f.pixfmt == p) return p;
@@ -2035,6 +2110,8 @@ struct source_capture {
       convert_yuyv_to_xrgb8888(src, in_stride, dst, conv_stride_bytes, in_w, in_h);
     } else if (in_pixfmt == V4L2_PIX_FMT_UYVY) {
       convert_uyvy_to_xrgb8888(src, in_stride, dst, conv_stride_bytes, in_w, in_h);
+    } else if (in_pixfmt == V4L2_PIX_FMT_YUV420) {
+      convert_yu12_to_xrgb8888(src, in_stride, dst, conv_stride_bytes, in_w, in_h);
     } else if (in_pixfmt == V4L2_PIX_FMT_XRGB32) {
       // If provided as XRGB32 already, just copy line-by-line (respect stride)
       for (uint32_t y=0; y<in_h; y++) {
@@ -2138,6 +2215,7 @@ struct comp_job {
   const out_to_vp_lut *lut=nullptr;
   const std::vector<layer_map_cache> *layer_maps=nullptr;
   const std::vector<int> *layer_source_index=nullptr;
+  persisted_config cfg{};
 };
 struct comp_worker { pthread_t th{}; int id=0; int cpu=-1; uint32_t y0=0,y1=0; };
 static pthread_mutex_t g_comp_mtx = PTHREAD_MUTEX_INITIALIZER;
@@ -2226,6 +2304,62 @@ static void composite_video_filtered_rows(const comp_job &job,
 
   apply_filter_chain(buf, L.filters);
 
+  // -------- OAK: feed inputs (visible/thermal) from this layer's post-filter buffer --------
+  if (job.cfg.oak_enable && L.oak.enabled &&
+      (L.oak.role == OAK_VISIBLE_IN || L.oak.role == OAK_THERMAL_IN)) {
+
+    // Require layer-space size to match oakW/oakH (you can achieve by layer scaling)
+    if (buf.w == job.cfg.oak_w && buf.h == job.cfg.oak_h) {
+      std::vector<uint8_t> gray;
+      if (layerbuf_to_gray8(buf, gray)) {
+        std::lock_guard<std::mutex> lk(g_oak_mtx);
+        oak_maybe_init_locked(job.cfg);
+        if (g_oak_inited) {
+          const uint64_t seq = g_oak_seq++;
+          std::string err;
+          bool ok = false;
+          if (L.oak.role == OAK_VISIBLE_IN) {
+            ok = g_oak.sendVisibleGray(gray.data(), gray.size(), seq, &err);
+          } else {
+            ok = g_oak.sendThermalGray(gray.data(), gray.size(), seq, &err);
+          }
+          if (!ok) g_oak_last_err = err;
+
+          // opportunistically pull output
+          std::vector<uint8_t> outG;
+          uint64_t outSeq = 0;
+          if (g_oak.tryGetOutputGray(outG, &outSeq, &err)) {
+            std::lock_guard<std::mutex> lk2(g_oak_out_mtx);
+            g_oak_out_gray = std::move(outG);
+            g_oak_out_seq = outSeq;
+          }
+        }
+      }
+    }
+  }
+
+  // -------- OAK: output layer replaces its buffer with the latest OAK output --------
+  if (job.cfg.oak_enable && L.oak.enabled && L.oak.role == OAK_OUTPUT) {
+    if (buf.w == job.cfg.oak_w && buf.h == job.cfg.oak_h) {
+      std::vector<uint8_t> outG;
+      {
+        std::lock_guard<std::mutex> lk(g_oak_out_mtx);
+        outG = g_oak_out_gray; // copy (small at 320x180)
+      }
+      if (outG.size() == (size_t)job.cfg.oak_w * (size_t)job.cfg.oak_h) {
+        layer_buf tmp;
+        gray8_to_layerbuf_xrgb(outG, job.cfg.oak_w, job.cfg.oak_h, tmp);
+        buf.px.swap(tmp.px);
+      } else {
+        // If no output yet, default to black in this layer
+        std::fill(buf.px.begin(), buf.px.end(), 0xFF000000u);
+      }
+    } else {
+      // If you mis-size the layer, render black to make it obvious
+      std::fill(buf.px.begin(), buf.px.end(), 0xFF000000u);
+    }
+  }
+
   rect_i32 ob_band = clamp_bounds_to_output_and_band(ob, job.out_w, job.out_h, y0, y1);
   if (rect_empty(ob_band)) return;
   const uint8_t layer_a = M.alpha;
@@ -2266,7 +2400,10 @@ static void composite_layers_rows(const comp_job &job, uint32_t y0, uint32_t y1)
     if (!sf) continue;
     const layer_map_cache &M = maps[li];
     if (!M.enabled) continue;
-    if (!L.filters.empty()) composite_video_filtered_rows(job, L, M, y0, y1, *sf);
+    //if (!L.filters.empty()) composite_video_filtered_rows(job, L, M, y0, y1, *sf);
+    //else composite_video_direct_rows(job, M, y0, y1, *sf);
+    const bool wants_oak = (job.cfg.oak_enable && L.oak.enabled && L.oak.role != OAK_NONE);
+    if (!L.filters.empty() || wants_oak) composite_video_filtered_rows(job, L, M, y0, y1, *sf);
     else composite_video_direct_rows(job, M, y0, y1, *sf);
   }
 }
@@ -2523,6 +2660,16 @@ struct pipeline {
     lut_ = {};
     layer_source_index_.clear();
     last_rendered_seq_any = 0;
+
+    // Reset OAK state on init to avoid stale pipeline
+    {
+      std::lock_guard<std::mutex> lk(g_oak_mtx);
+      oak_shutdown_locked();
+      if (cfg_wants_oak_pipeline(cfg)) {
+        oak_maybe_init_locked(cfg);
+      }
+    }
+
     return true;
   }
 
@@ -2545,6 +2692,10 @@ struct pipeline {
     sources.clear();
     if (conn) { drmModeFreeConnector(conn); conn=nullptr; }
     if (drm_fd>=0) { close(drm_fd); drm_fd=-1; }
+    {
+      std::lock_guard<std::mutex> lk(g_oak_mtx);
+      oak_shutdown_locked();
+    }
   }
 
   bool detect_input_change_and_request_reinit() {
@@ -2735,6 +2886,7 @@ struct pipeline {
     job.lut = &lut_;
     job.layer_maps = &layer_maps_;
     job.layer_source_index = &layer_source_index_;
+    job.cfg = cfg_live;
     comp_pool_run(job);
 
     if (!saw_frame) { fprintf(stderr, "[pipeline] first composited frame\n"); saw_frame=true; }
@@ -2815,6 +2967,16 @@ static std::string status_json() {
     {"sources", jsources},
     {"layerSources", jls},
   };
+
+  {
+    std::lock_guard<std::mutex> lk(g_oak_mtx);
+    j["oak"] = {
+      {"enabled", cfg_snapshot().oak_enable},
+      {"initialized", g_oak_inited},
+      {"lastError", g_oak_last_err},
+      {"lastOutSeq", (uint64_t)g_oak_out_seq},
+    };
+  }
 
   return j.dump();
 }
@@ -2949,6 +3111,12 @@ static bool apply_from_body(const std::string &body, std::string &out_json, int 
     }
   }
 
+  // after parsing other fields:
+  if (j.contains("oakEnable") && j["oakEnable"].is_boolean()) next.oak_enable = j["oakEnable"].get<bool>();
+  if (j.contains("oakMxid") && j["oakMxid"].is_string()) next.oak_mxid = j["oakMxid"].get<std::string>();
+  if (j.contains("oakW") && j["oakW"].is_number_integer()) next.oak_w = (uint32_t)std::max(1, j["oakW"].get<int>());
+  if (j.contains("oakH") && j["oakH"].is_number_integer()) next.oak_h = (uint32_t)std::max(1, j["oakH"].get<int>());
+
   // Layers: easiest safe path is to roundtrip through overlay_backend JSON parser by building a temp json string.
   if (j.contains("layers") && j["layers"].is_array()) {
     json tmp;
@@ -2966,6 +3134,10 @@ static bool apply_from_body(const std::string &body, std::string &out_json, int 
     tmp["tc358743Order"] = next.tc358743_order;
     tmp["auxSources"] = j.value("auxSources", json::array());
     tmp["v4l2Sources"] = next.v4l2_sources;
+    tmp["oakEnable"] = next.oak_enable;
+    tmp["oakMxid"]   = next.oak_mxid;
+    tmp["oakW"]      = next.oak_w;
+    tmp["oakH"]      = next.oak_h;
     persisted_config reparsed = next;
     if (!config_from_json_text(tmp.dump(), reparsed)) {
       out_http_status=400; out_json="{\"error\":\"invalid layers\"}"; return false;
@@ -2984,6 +3156,9 @@ static bool apply_from_body(const std::string &body, std::string &out_json, int 
   else if (next.prefer_output_mode != cur.prefer_output_mode) { need_reinit=true; reason="preferOutputMode changed"; }
   else if (next.prefer_out_w != cur.prefer_out_w || next.prefer_out_h != cur.prefer_out_h) { need_reinit=true; reason="preferOutputRes changed"; }
   else if (next.threads != cur.threads) { need_reinit=true; reason="threads changed"; }
+  else if (next.oak_enable != cur.oak_enable) { need_reinit=true; reason="oakEnable changed"; }
+  else if (next.oak_mxid != cur.oak_mxid) { need_reinit=true; reason="oakMxid changed"; }
+  else if (next.oak_w != cur.oak_w || next.oak_h != cur.oak_h) { need_reinit=true; reason="oakW/oakH changed"; }
 
   {
     std::lock_guard<std::mutex> lk(g_cfg_mtx);
@@ -3211,6 +3386,10 @@ int main(int argc, char **argv) {
   bool have_pipeline=false;
   for (;;) {
     auto snap=cfg_snapshot();
+    {
+      std::lock_guard<std::mutex> lk(g_oak_mtx);
+      if (!snap.oak_enable) oak_shutdown_locked();
+    }
     if (!present_policy_valid(snap.present_policy)) snap.present_policy="fit";
     if (p.init_from_config(snap)) { have_pipeline=true; break; }
     fprintf(stderr, "[supervisor] pipeline init failed; retrying in 1s...\n");

@@ -14,6 +14,21 @@ if [ ! -f third_party/json.hpp ]; then
 fi
 
 echo "[build] compiling..."
+
+# DepthAI is expected to be installed system-wide such that:
+#   - headers are reachable (e.g. /usr/include/depthai)
+#   - library is reachable (e.g. /usr/lib/aarch64-linux-gnu/libdepthai.so)
+#
+# If your include path differs, export:
+#   DEPTHAI_INC=/path/to/depthai/include
+# If your lib path differs, export:
+#   DEPTHAI_LIB=/path/to/depthai/lib
+
+DEPTHAI_INC=/media/FALCON/Luxonis/depthai-core/build/install/include
+DEPTHAI_LIB=/media/FALCON/Luxonis/depthai-core/build/install/lib
+DEPTHAI_DEPS_INC=/media/FALCON/Luxonis/depthai-core/build/install/lib/cmake/depthai/dependencies/include
+DEPTHAI_THIRD_PARTY_INC=/media/FALCON/Luxonis/depthai-core/build/install/include/depthai-shared/3rdparty
+
 CXXFLAGS=(
   -O3
   -march=native
@@ -25,6 +40,10 @@ CXXFLAGS=(
   -std=c++17
   -I/usr/include/libdrm
   -I./third_party
+  -I${DEPTHAI_INC}
+  -I${DEPTHAI_DEPS_INC}
+  -I${DEPTHAI_THIRD_PARTY_INC}
+  $(pkg-config --cflags opencv4)
 )
 
 LDFLAGS=(
@@ -32,6 +51,9 @@ LDFLAGS=(
   -ldrm
   -lv4l2
   -pthread
+  -L${DEPTHAI_LIB}
+  -ldepthai-core
+  $(pkg-config --libs opencv4)
 )
 
 g++ "${CXXFLAGS[@]}" \
@@ -40,6 +62,7 @@ g++ "${CXXFLAGS[@]}" \
   tc358743_webui.cpp \
   overlay_backend.cpp \
   v4l2_caps.cpp \
+  oak_accel.cpp \
   "${LDFLAGS[@]}"
 
 echo "[build] built: ./tc358743_drm_present_main"

@@ -10,7 +10,7 @@ struct point_i32 { int32_t x=0,y=0; };
 enum layer_invert_rel { INV_NONE=0, INV_LOWER=1, INV_UPPER=2 };
 enum layer_type { LAYER_VIDEO=0, LAYER_CROSSHAIR=1, LAYER_GRAPHICS=2 };
 
-enum filter_id { FILTER_MONO=1, FILTER_SOBEL=2, FILTER_DENOISE=3, FILTER_RGB_MAP=4, FILTER_RGB_KEY_ALPHA=5, FILTER_M3LITE_EDGE_MASK=6, FILTER_UNKNOWN=0 };
+enum filter_id { FILTER_MONO=1, FILTER_SOBEL=2, FILTER_DENOISE=3, FILTER_RGB_MAP=4, FILTER_RGB_KEY_ALPHA=5, FILTER_M3LITE_EDGE_MASK=6, FILTER_CLAHE=7, FILTER_UNKNOWN=0 };
 
 struct filter_cfg {
   filter_id id = FILTER_UNKNOWN;
@@ -41,6 +41,11 @@ struct filter_cfg {
   uint8_t keep_alpha = 255;   // alpha for non-keyed pixels
   bool set_rgb = false;       // if true, set RGB to out_r/out_g/out_b (for all pixels)
   uint8_t out_r = 255, out_g = 255, out_b = 255;
+
+  // CLAHE algorithm:
+  uint8_t clahe_x_tiles = 8;
+  uint8_t clahe_y_tiles = 8;
+  float clahe_clip_limit = 2.0f;
 };
 
 struct crosshair_layer_cfg {

@@ -32,7 +32,7 @@ DEPTHAI_THIRD_PARTY_INC=/media/FALCON/Luxonis/depthai-core/build/install/include
 CXXFLAGS=(
   -O3
   -march=native
-  -flto
+  -flto=auto
   -fomit-frame-pointer
   -DNDEBUG
   -Wall -Wextra
@@ -44,16 +44,18 @@ CXXFLAGS=(
   -I${DEPTHAI_DEPS_INC}
   -I${DEPTHAI_THIRD_PARTY_INC}
   $(pkg-config --cflags opencv4)
+  $(pkg-config --cflags egl glesv2)
 )
 
 LDFLAGS=(
-  -flto
+  -flto=auto
   -ldrm
   -lv4l2
   -pthread
   -L${DEPTHAI_LIB}
   -ldepthai-core
   $(pkg-config --libs opencv4)
+  $(pkg-config --libs egl glesv2)
 )
 
 g++ "${CXXFLAGS[@]}" \
@@ -63,6 +65,7 @@ g++ "${CXXFLAGS[@]}" \
   overlay_backend.cpp \
   v4l2_caps.cpp \
   oak_accel.cpp \
+  gpu_clahe.cpp \
   "${LDFLAGS[@]}"
 
 echo "[build] built: ./tc358743_drm_present_main"

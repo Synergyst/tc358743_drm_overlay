@@ -40,6 +40,9 @@
 #include "v4l2_caps.h"
 #include "v4l2_convert.h"
 #include "oak_accel.h"
+#define BYTE_IMAGE
+#include "clahe.h"
+#include "gpu_clahe.h"
 
 using nlohmann::json;
 
@@ -852,48 +855,6 @@ static void filter_apply_mono(layer_buf &buf, float strength) {
     buf.px[i] = 0xFF000000u | (rr<<16) | (gg<<8) | bb;
   }
 }
-/*static void filter_apply_sobel(layer_buf &buf, filter_cfg::sobel_mode_t mode, uint8_t threshold, float alpha_f, bool invert) {
-  if (buf.w < 3 || buf.h < 3) {
-    if (mode == filter_cfg::SOBEL_EDGES_ONLY) std::fill(buf.px.begin(), buf.px.end(), 0x00000000u);
-    else std::fill(buf.px.begin(), buf.px.end(), 0xFF000000u);
-    return;
-  }
-  alpha_f = std::clamp(alpha_f, 0.0f, 1.0f);
-  uint8_t edge_a = (uint8_t)std::lround(alpha_f * 255.0f);
-  std::vector<uint8_t> lum((size_t)buf.w*(size_t)buf.h);
-  for (size_t i=0;i<buf.px.size();i++) lum[i] = luma_u8_from_xrgb(buf.px[i]);
-  std::vector<uint32_t> out(buf.px.size());
-  auto idx = [&](int x,int y)->size_t { return (size_t)y*(size_t)buf.w + (size_t)x; };
-  for (uint32_t x=0;x<buf.w;x++) { out[idx((int)x,0)] = 0; out[idx((int)x,(int)buf.h-1)] = 0; }
-  for (uint32_t y=0;y<buf.h;y++) { out[idx(0,(int)y)] = 0; out[idx((int)buf.w-1,(int)y)] = 0; }
-  for (uint32_t y=1; y+1<buf.h; y++) {
-    for (uint32_t x=1; x+1<buf.w; x++) {
-      int xm1=(int)x-1, xp1=(int)x+1;
-      int ym1=(int)y-1, yp1=(int)y+1;
-      int p00 = lum[idx(xm1,ym1)];
-      int p01 = lum[idx((int)x,ym1)];
-      int p02 = lum[idx(xp1,ym1)];
-      int p10 = lum[idx(xm1,(int)y)];
-      int p12 = lum[idx(xp1,(int)y)];
-      int p20 = lum[idx(xm1,yp1)];
-      int p21 = lum[idx((int)x,yp1)];
-      int p22 = lum[idx(xp1,yp1)];
-      int gx = (-p00 + p02) + (-2*p10 + 2*p12) + (-p20 + p22);
-      int gy = (-p00 -2*p01 -p02) + (p20 +2*p21 + p22);
-      int mag = abs(gx) + abs(gy);
-      if (mag > 255) mag = 255;
-      uint8_t m = (uint8_t)mag;
-      if (invert) m = (uint8_t)(255 - m);
-      if (mode == filter_cfg::SOBEL_EDGES_ONLY) {
-        if (m < threshold || edge_a == 0) out[idx((int)x,(int)y)] = 0x00000000u;
-        else out[idx((int)x,(int)y)] = ((uint32_t)edge_a<<24) | ((uint32_t)m<<16) | ((uint32_t)m<<8) | (uint32_t)m;
-      } else {
-        out[idx((int)x,(int)y)] = 0xFF000000u | ((uint32_t)m<<16) | ((uint32_t)m<<8) | (uint32_t)m;
-      }
-    }
-  }
-  buf.px.swap(out);
-}*/
 static void filter_apply_sobel(layer_buf &buf, filter_cfg::sobel_mode_t mode, uint8_t threshold, float alpha_f, bool invert) {
   if (buf.w < 3 || buf.h < 3) {
     if (mode == filter_cfg::SOBEL_EDGES_ONLY) std::fill(buf.px.begin(), buf.px.end(), 0x00000000u);
@@ -1065,96 +1026,6 @@ static void filter_apply_sobel(layer_buf &buf, filter_cfg::sobel_mode_t mode, ui
 
   buf.px.swap(out);
 }
-/*static void filter_apply_denoise_box(layer_buf &buf, int radius, float strength) {
-  radius = std::max(1, std::min(radius, 8));
-  strength = std::clamp(strength, 0.0f, 1.0f);
-  if (strength <= 0.0f) return;
-
-  const uint32_t w = buf.w, h = buf.h;
-  if (w == 0 || h == 0) return;
-
-  // Two-pass box blur (separable): horizontal then vertical, then blend with original.
-  std::vector<uint32_t> tmp(buf.px.size());
-  std::vector<uint32_t> out(buf.px.size());
-
-  auto idx = [&](uint32_t x, uint32_t y) -> size_t { return (size_t)y * (size_t)w + (size_t)x; };
-
-  // Horizontal pass
-  for (uint32_t y = 0; y < h; y++) {
-    int sumR=0,sumG=0,sumB=0;
-    // init window at x=0
-    for (int dx = -radius; dx <= radius; dx++) {
-      int xx = std::max(0, std::min((int)w - 1, dx));
-      uint32_t p = buf.px[idx((uint32_t)xx, y)];
-      sumR += (p >> 16) & 0xFF;
-      sumG += (p >> 8) & 0xFF;
-      sumB += p & 0xFF;
-    }
-    int win = radius * 2 + 1;
-    for (uint32_t x = 0; x < w; x++) {
-      uint8_t r = (uint8_t)(sumR / win);
-      uint8_t g = (uint8_t)(sumG / win);
-      uint8_t b = (uint8_t)(sumB / win);
-      tmp[idx(x,y)] = 0xFF000000u | ((uint32_t)r<<16) | ((uint32_t)g<<8) | (uint32_t)b;
-
-      int x_out = (int)x - radius;
-      int x_in  = (int)x + radius + 1;
-      x_out = std::max(0, std::min((int)w - 1, x_out));
-      x_in  = std::max(0, std::min((int)w - 1, x_in));
-      uint32_t p_out = buf.px[idx((uint32_t)x_out, y)];
-      uint32_t p_in  = buf.px[idx((uint32_t)x_in, y)];
-      sumR += ((p_in >> 16) & 0xFF) - ((p_out >> 16) & 0xFF);
-      sumG += ((p_in >> 8) & 0xFF)  - ((p_out >> 8) & 0xFF);
-      sumB += (p_in & 0xFF)         - (p_out & 0xFF);
-    }
-  }
-
-  // Vertical pass
-  for (uint32_t x = 0; x < w; x++) {
-    int sumR=0,sumG=0,sumB=0;
-    for (int dy = -radius; dy <= radius; dy++) {
-      int yy = std::max(0, std::min((int)h - 1, dy));
-      uint32_t p = tmp[idx(x, (uint32_t)yy)];
-      sumR += (p >> 16) & 0xFF;
-      sumG += (p >> 8) & 0xFF;
-      sumB += p & 0xFF;
-    }
-    int win = radius * 2 + 1;
-    for (uint32_t y = 0; y < h; y++) {
-      uint8_t r = (uint8_t)(sumR / win);
-      uint8_t g = (uint8_t)(sumG / win);
-      uint8_t b = (uint8_t)(sumB / win);
-      out[idx(x,y)] = 0xFF000000u | ((uint32_t)r<<16) | ((uint32_t)g<<8) | (uint32_t)b;
-
-      int y_out = (int)y - radius;
-      int y_in  = (int)y + radius + 1;
-      y_out = std::max(0, std::min((int)h - 1, y_out));
-      y_in  = std::max(0, std::min((int)h - 1, y_in));
-      uint32_t p_out = tmp[idx(x, (uint32_t)y_out)];
-      uint32_t p_in  = tmp[idx(x, (uint32_t)y_in)];
-      sumR += ((p_in >> 16) & 0xFF) - ((p_out >> 16) & 0xFF);
-      sumG += ((p_in >> 8) & 0xFF)  - ((p_out >> 8) & 0xFF);
-      sumB += (p_in & 0xFF)         - (p_out & 0xFF);
-    }
-  }
-
-  // Blend original with blurred
-  if (strength >= 1.0f) {
-    buf.px.swap(out);
-    return;
-  }
-  const uint32_t a = (uint32_t)std::lround(strength * 255.0f);
-  for (size_t i = 0; i < buf.px.size(); i++) {
-    uint32_t orig = buf.px[i];
-    uint32_t blur = out[i];
-    uint32_t orr=(orig>>16)&0xFF, og=(orig>>8)&0xFF, ob=orig&0xFF;
-    uint32_t br =(blur>>16)&0xFF, bg=(blur>>8)&0xFF, bb=blur&0xFF;
-    uint32_t rr = (br*a + orr*(255-a) + 127)/255;
-    uint32_t gg = (bg*a + og *(255-a) + 127)/255;
-    uint32_t bb2= (bb*a + ob *(255-a) + 127)/255;
-    buf.px[i] = 0xFF000000u | (rr<<16) | (gg<<8) | bb2;
-  }
-}*/
 /*
   Drop-in faster denoise for RPi CM4:
   - Luma-only pipeline:
@@ -1414,28 +1285,7 @@ static inline bool chan_match(int mn, int mx, uint8_t v) {
   if (mn == -1 && mx == -1) return true;
   return (v >= (uint8_t)mn && v <= (uint8_t)mx);
 }
-/*static void filter_apply_rgb_map(layer_buf &buf,
-                                 int rmin, int rmax, uint8_t rout,
-                                 int gmin, int gmax, uint8_t gout,
-                                 int bmin, int bmax, uint8_t bout,
-                                 int amin, int amax, uint8_t aout) {
-  if (buf.w == 0 || buf.h == 0) return;
 
-  for (size_t i = 0; i < buf.px.size(); i++) {
-    uint32_t p = buf.px[i];
-    uint8_t pa = (uint8_t)((p >> 24) & 0xFF);
-    uint8_t r = (uint8_t)((p >> 16) & 0xFF);
-    uint8_t g = (uint8_t)((p >> 8) & 0xFF);
-    uint8_t b = (uint8_t)(p & 0xFF);
-
-    if (chan_match(rmin, rmax, r) &&
-        chan_match(gmin, gmax, g) &&
-        chan_match(bmin, bmax, b) &&
-        chan_match(amin, amax, pa)) {
-      buf.px[i] = ((uint32_t)aout << 24) | ((uint32_t)rout << 16) | ((uint32_t)gout << 8) | (uint32_t)bout;
-    }
-  }
-}*/
 static inline bool chan_is_wildcard(int mn, int mx) { return (mn == -1 && mx == -1); }
 
 // NEON accelerated RGBA range -> RGBA value mapping.
@@ -1617,34 +1467,6 @@ static inline bool is_key_white(uint8_t r, uint8_t g, uint8_t b, int th) {
   return (r >= lo) && (g >= lo) && (b >= lo);
 }
 
-/*static void filter_apply_rgb_key_alpha(layer_buf &buf,
-                                       filter_cfg::key_mode_t mode,
-                                       int threshold,
-                                       uint8_t keyA,
-                                       uint8_t keepA,
-                                       bool setRgb,
-                                       uint8_t outR, uint8_t outG, uint8_t outB) {
-  if (buf.w == 0 || buf.h == 0) return;
-  threshold = std::max(0, std::min(threshold, 255));
-
-  for (size_t i = 0; i < buf.px.size(); i++) {
-    uint32_t p = buf.px[i];
-    uint8_t r = (uint8_t)((p >> 16) & 0xFF);
-    uint8_t g = (uint8_t)((p >> 8) & 0xFF);
-    uint8_t b = (uint8_t)(p & 0xFF);
-
-    bool keyed = (mode == filter_cfg::KEY_WHITE)
-      ? is_key_white(r, g, b, threshold)
-      : is_key_black(r, g, b, threshold);
-
-    uint8_t a = keyed ? keyA : keepA;
-
-    if (setRgb) {
-      r = outR; g = outG; b = outB;
-    }
-    buf.px[i] = ((uint32_t)a << 24) | ((uint32_t)r << 16) | ((uint32_t)g << 8) | (uint32_t)b;
-  }
-}*/
 static void filter_apply_rgb_key_alpha(layer_buf &buf,
                                        filter_cfg::key_mode_t mode,
                                        int threshold,
@@ -1869,6 +1691,129 @@ static void filter_apply_m3lite_edge_mask(layer_buf &buf) {
     }
   }
 }
+
+static GpuCLAHE g_gpuClahe;
+static std::mutex g_gpuClahe_guard;
+static int g_gpuClahe_lastW=0, g_gpuClahe_lastH=0, g_gpuClahe_lastXT=0, g_gpuClahe_lastYT=0;
+
+static void filter_apply_clahe(layer_buf &buf, uint8_t x_tiles, uint8_t y_tiles, float clip_limit) {
+    if (buf.w == 0 || buf.h == 0 || buf.px.empty()) return;
+    if (x_tiles < 2 || y_tiles < 2) return;
+    if ((buf.w % x_tiles) != 0) return;
+    if ((buf.h % y_tiles) != 0) return;
+
+    // Extract luminance (8-bit)
+    std::vector<uint8_t> lum((size_t)buf.w * (size_t)buf.h);
+    for (size_t i = 0; i < buf.px.size(); i++) {
+        lum[i] = luma_u8_from_xrgb(buf.px[i]);
+    }
+
+    // --- GPU path ---
+    {
+        std::lock_guard<std::mutex> lk(g_gpuClahe_guard);
+
+        if (g_gpuClahe_lastW != (int)buf.w || g_gpuClahe_lastH != (int)buf.h ||
+          g_gpuClahe_lastXT != (int)x_tiles || g_gpuClahe_lastYT != (int)y_tiles) {
+
+          // If re-init needed, do it under the guard.
+          if (g_gpuClahe.init((int)buf.w, (int)buf.h, (int)x_tiles, (int)y_tiles)) {
+              g_gpuClahe_lastW = (int)buf.w;  g_gpuClahe_lastH = (int)buf.h;
+              g_gpuClahe_lastXT = (int)x_tiles; g_gpuClahe_lastYT = (int)y_tiles;
+          } else {
+              // init failed; do NOT update last*, so you can retry later.
+          }
+        }
+
+        std::vector<uint8_t> outLum((size_t)buf.w * (size_t)buf.h);
+        if (g_gpuClahe.run(lum.data(), clip_limit, outLum.data())) {
+            for (size_t i = 0; i < buf.px.size(); i++) {
+                uint8_t l = outLum[i];
+                buf.px[i] = 0xFF000000u | ((uint32_t)l << 16) | ((uint32_t)l << 8) | (uint32_t)l;
+            }
+            return;
+        }
+    }
+
+    // --- CPU fallback (your existing code) ---
+    int rc = CLAHE(
+        (kz_pixel_t*)lum.data(),
+        (unsigned int)buf.w,
+        (unsigned int)buf.h,
+        (kz_pixel_t)0,
+        (kz_pixel_t)255,
+        (unsigned int)x_tiles,
+        (unsigned int)y_tiles,
+        (unsigned int)256,
+        clip_limit
+    );
+    if (rc != 0) return;
+
+    for (size_t i = 0; i < buf.px.size(); i++) {
+        uint8_t l = lum[i];
+        buf.px[i] = 0xFF000000u | ((uint32_t)l << 16) | ((uint32_t)l << 8) | (uint32_t)l;
+    }
+}
+
+/*static void filter_apply_clahe(layer_buf &buf, uint8_t x_tiles, uint8_t y_tiles, float clip_limit) {
+    if (buf.w < 16 || buf.h < 16) return;
+
+    // 1. Extract Luminance (8-bit)
+    std::vector<uint8_t> lum(buf.w * buf.h);
+    for (size_t i = 0; i < buf.px.size(); i++) {
+        lum[i] = luma_u8_from_xrgb(buf.px[i]);
+    }
+
+    // 2. Apply CLAHE
+    // Karel Zuiderveld's CLAHE signature:
+    // CLAHE(image_ptr, width, height, min_val, max_val, x_tiles, y_tiles, bins, clip_limit)
+    CLAHE(lum.data(), (unsigned int)buf.w, (unsigned int)buf.h, 0, 255, x_tiles, y_tiles, 256, clip_limit);
+
+    // 3. Write back to Framebuffer
+    for (size_t i = 0; i < buf.px.size(); i++) {
+        uint8_t l = lum[i];
+        // Re-pack as XRGB (Grayscale look for "realistic" hallway)
+        buf.px[i] = 0xFF000000u | (l << 16) | (l << 8) | l;
+    }
+}*/
+/*static void filter_apply_clahe(layer_buf &buf, uint8_t x_tiles, uint8_t y_tiles, float clip_limit) {
+    if (buf.w == 0 || buf.h == 0 || buf.px.empty()) return;
+
+    // CLAHE code requires at least 2x2 regions and exact divisibility.
+    if (x_tiles < 2 || y_tiles < 2) return;
+    if ((buf.w % x_tiles) != 0) return;
+    if ((buf.h % y_tiles) != 0) return;
+
+    // 1) Extract luminance (8-bit)
+    std::vector<uint8_t> lum((size_t)buf.w * (size_t)buf.h);
+    for (size_t i = 0; i < buf.px.size(); i++) {
+        lum[i] = luma_u8_from_xrgb(buf.px[i]);
+    }
+
+    // 2) Apply CLAHE (8-bit mode requires BYTE_IMAGE)
+    // Note: the CLAHE function returns negative error codes on invalid params.
+    int rc = CLAHE(
+        (kz_pixel_t*)lum.data(),
+        (unsigned int)buf.w,
+        (unsigned int)buf.h,
+        (kz_pixel_t)0,
+        (kz_pixel_t)255,
+        (unsigned int)x_tiles,
+        (unsigned int)y_tiles,
+        (unsigned int)256,
+        clip_limit
+    );
+    if (rc != 0) {
+        // If you have logging, log rc; otherwise just bail without modifying the buffer further.
+        return;
+    }
+
+    // 3) Write back as grayscale XRGB
+    for (size_t i = 0; i < buf.px.size(); i++) {
+        uint8_t l = lum[i];
+        buf.px[i] = 0xFF000000u | ((uint32_t)l << 16) | ((uint32_t)l << 8) | (uint32_t)l;
+    }
+}*/
+
 static void apply_filter_chain(layer_buf &buf, const std::vector<filter_cfg> &filters) {
   for (const auto &f : filters) {
     if (f.id == FILTER_MONO) {
@@ -1887,6 +1832,8 @@ static void apply_filter_chain(layer_buf &buf, const std::vector<filter_cfg> &fi
       filter_apply_rgb_key_alpha(buf, f.key_mode, f.key_threshold, f.key_alpha, f.keep_alpha, f.set_rgb, f.out_r, f.out_g, f.out_b);
     } else if (f.id == FILTER_M3LITE_EDGE_MASK) {
       filter_apply_m3lite_edge_mask(buf);
+    } else if (f.id == FILTER_CLAHE) {
+      filter_apply_clahe(buf, f.clahe_x_tiles, f.clahe_y_tiles, f.clahe_clip_limit);
     }
   }
 }
@@ -1951,6 +1898,32 @@ struct source_capture {
       in_pixfmt = V4L2_PIX_FMT_RGB24;
       fprintf(stderr, "[source] %s: using RGB24 %ux%u stride=%u\n", dev.c_str(), in_w, in_h, in_stride);
     }
+
+    // Try YUYV then UYVY, then fallback to RGB24.
+    /*if (v4l2_set_fmt_capture(vfd, V4L2_PIX_FMT_YUYV, 0, 0, &in_w, &in_h, &in_stride) == 0) {
+      in_pixfmt = V4L2_PIX_FMT_YUYV;
+      fprintf(stderr, "[source] %s: using YUYV %ux%u stride=%u\n", dev.c_str(), in_w, in_h, in_stride);
+    } else if (v4l2_set_fmt_capture(vfd, V4L2_PIX_FMT_UYVY, 0, 0, &in_w, &in_h, &in_stride) == 0) {
+      in_pixfmt = V4L2_PIX_FMT_UYVY;
+      fprintf(stderr, "[source] %s: using UYVY %ux%u stride=%u\n", dev.c_str(), in_w, in_h, in_stride);
+    } else {
+      if (tc358743_set_pixfmt_rgb24(vfd, &in_w, &in_h, &in_stride) != 0) return false;
+      in_pixfmt = V4L2_PIX_FMT_RGB24;
+      fprintf(stderr, "[source] %s: using RGB24 %ux%u stride=%u\n", dev.c_str(), in_w, in_h, in_stride);
+    }*/
+
+    // Try RGB24 then UYVY, then fallback to YUYV.
+    /*if (tc358743_set_pixfmt_rgb24(vfd, &in_w, &in_h, &in_stride) == 0) {
+      in_pixfmt = V4L2_PIX_FMT_RGB24;
+      fprintf(stderr, "[source] %s: using RGB24 %ux%u stride=%u\n", dev.c_str(), in_w, in_h, in_stride);
+    } else if (v4l2_set_fmt_capture(vfd, V4L2_PIX_FMT_UYVY, 0, 0, &in_w, &in_h, &in_stride) == 0) {
+      in_pixfmt = V4L2_PIX_FMT_UYVY;
+      fprintf(stderr, "[source] %s: using UYVY %ux%u stride=%u\n", dev.c_str(), in_w, in_h, in_stride);
+    } else {
+      if (v4l2_set_fmt_capture(vfd, V4L2_PIX_FMT_YUYV, 0, 0, &in_w, &in_h, &in_stride) != 0) return false;
+      in_pixfmt = V4L2_PIX_FMT_YUYV;
+      fprintf(stderr, "[source] %s: using YUYV %ux%u stride=%u\n", dev.c_str(), in_w, in_h, in_stride);
+    }*/
 
     if (v4l2_start_mmap_capture(vfd, &cbufs, &cbuf_count) != 0) return false;
     have_held_buf=false;

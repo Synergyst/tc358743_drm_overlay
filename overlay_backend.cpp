@@ -208,6 +208,17 @@ json filter_registry_json() {
     f["params"] = json::object(); // no params for now
     filters.push_back(f);
   }
+  {
+    json f;
+    f["id"] = "clahe";
+    f["name"] = "CLAHE (Contrast Limited Adaptive Histogram Equalization)";
+    f["params"] = {
+      {"x_tiles", 8},           // 8..16
+      {"y_tiles", 8},           // 8..16
+      {"clip_limit", 0.1},      // 0..255
+    };
+    filters.push_back(f);
+  }
   j["filters"] = filters;
   return j;
 }
@@ -312,6 +323,13 @@ std::string config_to_json(const persisted_config &c_in) {
         } else if (F.id == FILTER_M3LITE_EDGE_MASK) {
           jf["id"] = "m3liteEdgeMask";
           jf["params"] = json::object();
+        } else if (F.id == FILTER_CLAHE) {
+          jf["id"] = "clahe";
+          jf["params"] = {
+            {"x_tiles", std::clamp(static_cast<int>(F.clahe_x_tiles), 8, 16)},
+            {"y_tiles", std::clamp(static_cast<int>(F.clahe_y_tiles), 8, 16)},
+            {"clip_limit", std::clamp(F.clahe_clip_limit, 0.1f, 8.0f)},
+          };
         } else {
           jf["id"] = "unknown";
           jf["params"] = json::object();
@@ -596,6 +614,22 @@ bool config_from_json_text(const std::string &text, persisted_config &c) {
           } else if (id == "m3liteEdgeMask") {
             fc.id = FILTER_M3LITE_EDGE_MASK;
             // no params
+          } else if (id == "clahe") {
+            fc.id = FILTER_CLAHE;
+            if (jf.contains("params") && jf["params"].is_object()) {
+              int x = jf["params"].value("x_tiles", 8);
+              if (x < 8) x = 8;
+              if (x > 16) x = 16;
+              fc.clahe_x_tiles = x;
+
+              int y = jf["params"].value("y_tiles", 8);
+              if (y < 8) y = 8;
+              if (y > 16) y = 16;
+              fc.clahe_y_tiles = y;
+
+              double st = jf["params"].value("clip_limit", 0.1);
+              fc.clahe_clip_limit = (float)std::clamp(st, 0.0, 8.0);
+            }
           } else {
             continue;
           }

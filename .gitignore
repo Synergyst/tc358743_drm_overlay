@@ -1,0 +1,5 @@
+sobel_m3lite_present
+tc358743_drm_present_main
+*.o
+*.so
+.cache

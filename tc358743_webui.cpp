@@ -684,7 +684,16 @@ const FILTER_FALLBACK = {
       id: "m3liteEdgeMask",
       name: "M3Lite edge mask (combined)",
       params: []
-    }
+    },
+    {
+      id: "clahe",
+      name: "CLAHE",
+      params: [
+        { k:"x_tiles", type:"int", min:8, max:16, default:8 },
+        { k:"y_tiles", type:"int", min:8, max:16, default:8 },
+        { k:"clip_limit", type:"float", min:0.1, max:8.0, default:2.0 }
+      ]
+    },
   ]
 };
 function schemaForKnownFilterId(id){
@@ -694,6 +703,7 @@ function schemaForKnownFilterId(id){
   if (id === 'rgbMap') return FILTER_FALLBACK.filters[3].params;
   if (id === 'rgbKeyAlpha') return FILTER_FALLBACK.filters[4].params;
   if (id === 'm3liteEdgeMask') return FILTER_FALLBACK.filters[5].params;
+  if (id === 'clahe') return FILTER_FALLBACK.filters[6].params;
   return [];
 }
 function normalizeFilterDef(def){

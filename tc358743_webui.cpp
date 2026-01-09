@@ -701,6 +701,16 @@ const FILTER_FALLBACK = {
         { k:"threshold", type:"int", min:0, max:255, default:1 },
       ]
     },
+    {
+      id: "edgethermal",
+      name: "Thermal Edge Detection",
+      params: [
+        { k:"gain", type:"float", min:0.0, max:255.0, default:3.0 },
+        { k:"threshold", type:"int", min:0, max:255, default:8 },
+        { k:"blur_strength", type:"int", min:0, max:255, default:1 },
+        { k:"threads", type:"int", min:0, max:4, default:0 },
+      ]
+    },
   ]
 };
 function schemaForKnownFilterId(id){
@@ -712,6 +722,7 @@ function schemaForKnownFilterId(id){
   if (id === 'm3liteEdgeMask') return FILTER_FALLBACK.filters[5].params;
   if (id === 'clahe') return FILTER_FALLBACK.filters[6].params;
   if (id === 'thin') return FILTER_FALLBACK.filters[7].params;
+  if (id === 'edgethermal') return FILTER_FALLBACK.filters[8].params;
   return [];
 }
 function normalizeFilterDef(def){
@@ -2144,6 +2155,47 @@ void webui_start_detached(int port) {
       }
       res.set_content(fn(dev), "application/json");
     });
+
+svr.Get("/stream.mjpeg", [](const httplib::Request&, httplib::Response &res) {
+    res.set_content_provider(
+        "multipart/x-mixed-replace; boundary=frame",
+        [](size_t offset, httplib::DataSink &sink) {
+            uint64_t last_sent_seq = 0;
+
+            while (true) {
+                std::vector<uint8_t> frame_to_send;
+
+                // 1. Wait for a new frame
+                {
+                    std::unique_lock<std::mutex> lk(g_frame_mtx);
+                    g_frame_cv.wait(lk, [&] { 
+                        return g_frame_sequence > last_sent_seq || (g_quit && g_quit->load()); 
+                    });
+
+                    if (g_quit && g_quit->load()) return false; // Exit if server shutting down
+
+                    frame_to_send = g_current_mjpeg_frame;
+                    last_sent_seq = g_frame_sequence;
+                }
+
+                // 2. Format the MJPEG chunk
+                std::string header = 
+                    "--frame\r\n"
+                    "Content-Type: image/jpeg\r\n"
+                    "Content-Length: " + std::to_string(frame_to_send.size()) + "\r\n\r\n";
+
+                // 3. Push to client
+                if (!sink.write(header.data(), header.size())) return false;
+                if (!sink.write(reinterpret_cast<const char*>(frame_to_send.data()), frame_to_send.size())) return false;
+                if (!sink.write("\r\n", 2)) return false;
+
+                // If sink.is_writable() returns false, the client likely disconnected
+                if (sink.is_writable && !sink.is_writable()) return false;
+            }
+            return true;
+        }
+    );
+});
 
     svr.Post("/api/apply", [](const httplib::Request &req, httplib::Response &res) {
       bool (*apply)(const std::string&, std::string&, int&) = nullptr;

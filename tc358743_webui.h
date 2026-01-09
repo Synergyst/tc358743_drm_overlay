@@ -2,6 +2,7 @@
 #include <atomic>
 #include <string>
 #include <vector>
+#include <condition_variable>
 
 // Existing API wiring
 void webui_set_config_json_provider(std::string (*fn)());
@@ -23,3 +24,9 @@ void webui_set_v4l2_caps_provider(std::string (*fn)(const std::string &dev));
 
 // Start server thread
 void webui_start_detached(int port);
+
+// Live feed
+static std::mutex g_frame_mtx;
+static std::condition_variable g_frame_cv;
+static std::vector<uint8_t> g_current_mjpeg_frame;
+static uint64_t g_frame_sequence = 0; // To track if a frame is actually "new"

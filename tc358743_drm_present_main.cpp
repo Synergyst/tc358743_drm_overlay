@@ -5,6 +5,7 @@
 #include <assert.h>
 #include <errno.h>
 #include <fcntl.h>
+#include <turbojpeg.h>
 #include <linux/videodev2.h>
 #include <poll.h>
 #include <pthread.h>
@@ -84,6 +85,32 @@ static uint64_t monotonic_ms() {
   struct timespec ts;
   clock_gettime(CLOCK_MONOTONIC, &ts);
   return (uint64_t)ts.tv_sec * 1000ull + (uint64_t)ts.tv_nsec / 1000000ull;
+}
+
+// Sketch of the missing encoder function using libjpeg-turbo
+bool encode_frame_to_jpeg(void* src_map, int w, int h, int pitch, std::vector<uint8_t>& out_jpeg) {
+    if (!src_map) return false;
+
+    tjhandle compressor = tjInitCompress();
+    if (!compressor) return false;
+
+    unsigned char* dest_buf = nullptr;
+    unsigned long dest_size = 0;
+
+    // TJPF_BGRX is usually the correct mapping for DRM_FORMAT_XRGB8888
+    // on little-endian systems (Byte 0=B, 1=G, 2=R, 3=X).
+    // Using 'pitch' instead of '0' handles row padding correctly.
+    int status = tjCompress2(compressor, static_cast<unsigned char*>(src_map), w, pitch, h, TJPF_BGRX, &dest_buf, &dest_size, TJSAMP_420, 80, TJFLAG_FASTDCT);
+
+    if (status == 0) {
+        out_jpeg.assign(dest_buf, dest_buf + dest_size);
+    }
+
+    // TurboJPEG allocates the dest_buf internally; we must free it.
+    tjFree(dest_buf);
+    tjDestroy(compressor);
+
+    return (status == 0);
 }
 
 // ---------------- raw terminal (q to quit) ----------------
@@ -1845,87 +1872,157 @@ static void filter_apply_thin_image(layer_buf& buf, uint8_t threshold) {
     }
 }
 
-/*static void filter_apply_thin_image(layer_buf& buf, uint8_t threshold) {
-    if (buf.w <= 0 || buf.h <= 0) return;
+// Edge detect tuned for low-contrast thermal imagery:
+// 1) fast local contrast normalization via (approx) 3x3 box blur subtraction
+// 2) Scharr gradient magnitude on the high-passed image (better than Sobel for weak edges)
+// 3) optional soft threshold + gain
+//
+// Input/Output: layer_buf XRGB8888 (0xXXRRGGBB). Preserves the top byte (XX).
+// Output: edges as white on black by default (RGB), but you can change composition easily.
+static void filter_apply_edge_thermal(layer_buf& buf,
+                                      float gain = 3.0f,
+                                      uint8_t threshold = 8,
+                                      uint8_t blur_strength = 1,
+                                      uint8_t threads = 1) {
+  if (buf.w < 3 || buf.h < 3 || buf.px.empty()) return;
 
-    const size_t n = (size_t)buf.w * (size_t)buf.h;
-    if (buf.px.size() < n) return;
+  const int w = (int)buf.w, h = (int)buf.h;
+  const size_t n = (size_t)w * (size_t)h;
+  if (buf.px.size() != n) return; // with your layer_buf, this should always match
 
-    // IMPORTANT: avoid static shared scratch if filters can run on multiple threads
-    thread_local std::vector<uint8_t> bin;
-    bin.assign(n, 0);
+  gain = std::max(0.0f, gain);
 
-    // XRGB8888 -> binary (0/255)
-    for (size_t i = 0; i < n; i++) {
-        const uint32_t p = buf.px[i];              // 0xXXRRGGBB
-        const uint32_t r = (p >> 16) & 0xFF;
-        const uint32_t g = (p >>  8) & 0xFF;
-        const uint32_t b = (p >>  0) & 0xFF;
-        const uint8_t  y = (uint8_t)((r*77 + g*150 + b*29 + 128) >> 8);
-        bin[i] = (y >= threshold) ? 255 : 0;
+  /*if (threads == 0) {
+    unsigned hc = std::thread::hardware_concurrency();
+    threads = hc ? hc : 4;
+  }
+  threads = std::max(1u, threads);*/
+  //threads = 1;
+
+  auto clamp_u8 = [](int v) -> uint8_t { return (uint8_t)std::clamp(v, 0, 255); };
+
+  // IMPORTANT: Do NOT use thread_local scratch here if your filter can be re-entered on the same thread
+  // (common with nested compositing / callbacks). Instead, allocate locally per call.
+  // This costs allocations; you can replace with a per-layer scratch cache later.
+  std::vector<uint8_t> Y(n), B(n), HP(n), E(n);
+
+  auto luma_u8 = [](uint32_t p) -> uint8_t {
+    const uint32_t r = (p >> 16) & 0xFF;
+    const uint32_t g = (p >>  8) & 0xFF;
+    const uint32_t b = (p >>  0) & 0xFF;
+    return (uint8_t)((r*77 + g*150 + b*29 + 128) >> 8);
+  };
+
+  auto parallel_rows = [&](int y0, int y1, auto&& fn) {
+    const int total = y1 - y0;
+    const int chunk = (total + (int)threads - 1) / (int)threads;
+    std::vector<std::thread> ts;
+    ts.reserve(threads);
+    for (unsigned t = 0; t < threads; t++) {
+      int a = y0 + (int)t * chunk;
+      int b = std::min(y1, a + chunk);
+      if (a >= b) break;
+      ts.emplace_back([=, &fn]() { fn(a, b); });
     }
+    for (auto& th : ts) th.join();
+  };
 
-    // Thin 8-bit binary image (tight stride)
-    thinimg::ThinImageBinaryInPlace(bin.data(), buf.w, buf.h, buf.w);
+  // 1) XRGB8888 -> GRAY8
+  parallel_rows(0, h, [&](int ya, int yb) {
+    for (int y = ya; y < yb; y++) {
+      const uint32_t* src = buf.px.data() + (size_t)y * (size_t)w;
+      uint8_t* dst = Y.data() + (size_t)y * (size_t)w;
+      for (int x = 0; x < w; x++) dst[x] = luma_u8(src[x]);
+    }
+  });
 
-    // Overlay skeleton as white, preserve top byte
-    for (size_t i = 0; i < n; i++) {
-        if (bin[i]) {
-            const uint32_t x = buf.px[i] & 0xFF000000u;
-            buf.px[i] = x | 0x00FFFFFFu;
+  // 2) Blur/high-pass for low contrast (blur_strength==0 disables)
+  if (blur_strength) {
+    // 3x3 box blur
+    parallel_rows(0, h, [&](int ya, int yb) {
+      for (int y = ya; y < yb; y++) {
+        const int ym1 = (y > 0) ? (y - 1) : y;
+        const int yp1 = (y + 1 < h) ? (y + 1) : y;
+
+        const uint8_t* r0 = Y.data() + (size_t)ym1 * (size_t)w;
+        const uint8_t* r1 = Y.data() + (size_t)y   * (size_t)w;
+        const uint8_t* r2 = Y.data() + (size_t)yp1 * (size_t)w;
+
+        uint8_t* out = B.data() + (size_t)y * (size_t)w;
+
+        for (int x = 0; x < w; x++) {
+          const int xm1 = (x > 0) ? (x - 1) : x;
+          const int xp1 = (x + 1 < w) ? (x + 1) : x;
+          const int sum =
+            r0[xm1] + r0[x] + r0[xp1] +
+            r1[xm1] + r1[x] + r1[xp1] +
+            r2[xm1] + r2[x] + r2[xp1];
+          out[x] = (uint8_t)((sum + 4) / 9);
         }
-    }
-}*/
+      }
+    });
 
-// Example: thin bright pixels and draw skeleton in white over original
-/*static inline void filter_apply_thin_image(layer_buf &buf, uint8_t threshold) {
-    if (buf.w <= 0 || buf.h <= 0 || buf.px.empty()) return;
-
-    const size_t n = (size_t)buf.w * (size_t)buf.h;
-
-    // 1) Build binary mask (0 or 255)
-    std::vector<uint8_t> bin(n);
-    for (size_t i = 0; i < n; i++) {
-        uint8_t y = luma_u8_from_xrgb(buf.px[i]);
-        bin[i] = (y >= threshold) ? 255 : 0;
-    }
-
-    // 2) Thin in place (stride = width for tightly packed 8-bit)
-    thinimg::ThinImageBinaryInPlace(
-        bin.data(),
-        buf.w,
-        buf.h,
-        buf.w,
-        nullptr // or provide a lambda to log passes
-    );
-
-    // 3) Composite result back (example: set thinned pixels to white)
-    for (size_t i = 0; i < n; i++) {
-        if (bin[i]) {
-            buf.px[i] = 0xFFFFFFFFu; // white skeleton
+    // High-pass centered at 128
+    parallel_rows(0, h, [&](int ya, int yb) {
+      for (int y = ya; y < yb; y++) {
+        const uint8_t* a = Y.data() + (size_t)y * (size_t)w;
+        const uint8_t* b = B.data() + (size_t)y * (size_t)w;
+        uint8_t* o = HP.data() + (size_t)y * (size_t)w;
+        for (int x = 0; x < w; x++) {
+          int v = (int)a[x] - (int)b[x] + 128;
+          o[x] = (uint8_t)std::clamp(v, 0, 255);
         }
+      }
+    });
+  } else {
+    HP = Y;
+  }
+
+  // 3) Scharr edges on HP
+  parallel_rows(0, h, [&](int ya, int yb) {
+    for (int y = ya; y < yb; y++) {
+      const int ym1 = (y > 0) ? (y - 1) : y;
+      const int yp1 = (y + 1 < h) ? (y + 1) : y;
+
+      const uint8_t* r0 = HP.data() + (size_t)ym1 * (size_t)w;
+      const uint8_t* r1 = HP.data() + (size_t)y   * (size_t)w;
+      const uint8_t* r2 = HP.data() + (size_t)yp1 * (size_t)w;
+
+      uint8_t* out = E.data() + (size_t)y * (size_t)w;
+
+      for (int x = 0; x < w; x++) {
+        const int xm1 = (x > 0) ? (x - 1) : x;
+        const int xp1 = (x + 1 < w) ? (x + 1) : x;
+
+        const int a = r0[xm1], b0 = r0[x], c = r0[xp1];
+        const int d = r1[xm1],           f = r1[xp1];
+        const int g0 = r2[xm1], h0 = r2[x], i0 = r2[xp1];
+
+        const int gx = ( 3*c + 10*f + 3*i0) - ( 3*a + 10*d + 3*g0);
+        const int gy = ( 3*g0 + 10*h0 + 3*i0) - ( 3*a + 10*b0 + 3*c);
+
+        int mag = std::abs(gx) + std::abs(gy);
+        mag = (int)std::lround((double)mag * (double)gain / 16.0);
+        mag = (mag > (int)threshold) ? (mag - (int)threshold) : 0;
+
+        out[x] = clamp_u8(mag);
+      }
     }
-}*/
+  });
 
-/*static void filter_apply_thin_image(layer_buf &buf, uint8_t x_tiles, uint8_t y_tiles, float clip_limit) {
-    if (buf.w < 16 || buf.h < 16) return;
-
-    // 1. Extract Luminance (8-bit)
-    std::vector<uint8_t> lum(buf.w * buf.h);
-    for (size_t i = 0; i < buf.px.size(); i++) {
-        lum[i] = luma_u8_from_xrgb(buf.px[i]);
+  // 4) Write back as grayscale edges, preserve top byte
+  parallel_rows(0, h, [&](int ya, int yb) {
+    for (int y = ya; y < yb; y++) {
+      uint32_t* dst = buf.px.data() + (size_t)y * (size_t)w;
+      const uint8_t* src = E.data() + (size_t)y * (size_t)w;
+      for (int x = 0; x < w; x++) {
+        const uint32_t top = dst[x] & 0xFF000000u;
+        const uint32_t v = (uint32_t)src[x];
+        dst[x] = top | (v << 16) | (v << 8) | v;
+      }
     }
-
-    // 2. Apply thin_image
-    //
-
-    // 3. Write back to Framebuffer
-    for (size_t i = 0; i < buf.px.size(); i++) {
-        uint8_t l = lum[i];
-        // Re-pack as XRGB (Grayscale look for "realistic" hallway)
-        buf.px[i] = 0xFF000000u | (l << 16) | (l << 8) | l;
-    }
-}*/
+  });
+}
 
 static void apply_filter_chain(layer_buf &buf, const std::vector<filter_cfg> &filters) {
   for (const auto &f : filters) {
@@ -1949,6 +2046,8 @@ static void apply_filter_chain(layer_buf &buf, const std::vector<filter_cfg> &fi
       filter_apply_clahe(buf, f.clahe_x_tiles, f.clahe_y_tiles, f.clahe_clip_limit);
     } else if (f.id == FILTER_THIN_IMAGE) {
       filter_apply_thin_image(buf, f.thin_image_threshold);
+    } else if (f.id == FILTER_EDGE_THERMAL) {
+      filter_apply_edge_thermal(buf, f.edge_thermal_gain, f.edge_thermal_threshold, f.edge_thermal_blur_strength, f.edge_thermal_threads);
     }
   }
 }
@@ -2979,6 +3078,24 @@ struct pipeline {
 
     if (!saw_frame) { fprintf(stderr, "[pipeline] first composited frame\n"); saw_frame=true; }
     if (drm_plane_flip_fb_only(drm_fd, plane_id, p_fb_id, fb[next].fb_id) != 0) return false;
+    // synergyst
+// 2. Prepare the frame for the Web UI
+// Note: We do this AFTER the flip call so we don't delay the HDMI sync
+{
+    // A. Encode the raw pixels to JPEG
+    // You will need a helper function here (see below)
+    std::vector<uint8_t> jpeg_buffer;
+    // Use .map and .pitch from your struct
+    if (encode_frame_to_jpeg(fb[next].map, fb[next].width, fb[next].height, fb[next].pitch, jpeg_buffer)) {
+        {
+            std::lock_guard<std::mutex> lk(g_frame_mtx);
+            g_current_mjpeg_frame = std::move(jpeg_buffer);
+            g_frame_sequence++;
+        }
+        g_frame_cv.notify_all();
+    }
+}
+    //
     cur=next;
     last_rendered_seq_any = any_seq;
     return true;

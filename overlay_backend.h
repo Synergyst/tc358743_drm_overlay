@@ -10,7 +10,7 @@ struct point_i32 { int32_t x=0,y=0; };
 enum layer_invert_rel { INV_NONE=0, INV_LOWER=1, INV_UPPER=2 };
 enum layer_type { LAYER_VIDEO=0, LAYER_CROSSHAIR=1, LAYER_GRAPHICS=2 };
 
-enum filter_id { FILTER_MONO=1, FILTER_SOBEL=2, FILTER_DENOISE=3, FILTER_RGB_MAP=4, FILTER_RGB_KEY_ALPHA=5, FILTER_M3LITE_EDGE_MASK=6, FILTER_CLAHE=7, FILTER_THIN_IMAGE=8, FILTER_UNKNOWN=0 };
+enum filter_id { FILTER_MONO=1, FILTER_SOBEL=2, FILTER_DENOISE=3, FILTER_RGB_MAP=4, FILTER_RGB_KEY_ALPHA=5, FILTER_M3LITE_EDGE_MASK=6, FILTER_CLAHE=7, FILTER_THIN_IMAGE=8, FILTER_EDGE_THERMAL=9, FILTER_UNKNOWN=0 };
 
 struct filter_cfg {
   filter_id id = FILTER_UNKNOWN;
@@ -49,6 +49,12 @@ struct filter_cfg {
 
   // Thin Image algorithm:
   uint8_t thin_image_threshold = 1;
+
+  // Edge Thermal detection
+  float edge_thermal_gain = 3.0f;
+  uint8_t edge_thermal_threshold = 8;
+  uint8_t edge_thermal_blur_strength = 1;
+  uint8_t edge_thermal_threads = 0;
 };
 
 struct crosshair_layer_cfg {

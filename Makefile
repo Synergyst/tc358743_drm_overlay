@@ -68,6 +68,7 @@ CXXFLAGS += \
     -fdata-sections \
     -Wno-unused-parameter \
     -Wno-type-limits \
+    $(pkg-config --cflags libjpeg libturbojpeg) \
     -I/usr/include/libdrm \
     -I./$(THIRD_PARTY_DIR) \
     -I$(DEPTHAI_INC) \
@@ -90,6 +91,8 @@ LDLIBS += \
     -lbz2 \
     -llzma \
     -ludev \
+    $(pkg-config --libs libjpeg libturbojpeg) \
+    /usr/lib/aarch64-linux-gnu/libturbojpeg.a \
     $(DEPTHAI_LIB)/libdepthai-core.a \
     -Wl,--whole-archive $(DEPTHAI_RES_A) -Wl,--no-whole-archive \
     $(DEPTHAI_XLINK_A) \
@@ -121,7 +124,7 @@ endif
 
 all: deps $(TARGET)
 	@echo "[build] built: ./$(TARGET)"
-	#strip --strip-unneeded ./$(TARGET)
+	strip --strip-unneeded ./$(TARGET)
 
 deps: $(HTTPLIB_H) $(JSON_HPP)
 

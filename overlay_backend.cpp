@@ -228,6 +228,18 @@ json filter_registry_json() {
     };
     filters.push_back(f);
   }
+  {
+    json f;
+    f["id"] = "edgethermal";
+    f["name"] = "Thermal Edge Detection";
+    f["params"] = {
+      {"gain", 3.0f},           // 0f..8.0f
+      {"threshold", 8},      // 0..255
+      {"blur_strength", 1},  // 0..255
+      {"threads", 0},        // 0..4
+    };
+    filters.push_back(f);
+  }
   j["filters"] = filters;
   return j;
 }
@@ -343,6 +355,14 @@ std::string config_to_json(const persisted_config &c_in) {
           jf["id"] = "thin";
           jf["params"] = {
             {"threshold", std::clamp(static_cast<int>(F.thin_image_threshold), 0, 255)},
+          };
+        } else if (F.id == FILTER_EDGE_THERMAL) {
+          jf["id"] = "edgethermal";
+          jf["params"] = {
+            {"gain", std::clamp(F.edge_thermal_gain, 0.0f, 255.0f)},
+            {"threshold", std::clamp(static_cast<int>(F.edge_thermal_threshold), 0, 255)},
+            {"blur_strength", std::clamp(static_cast<int>(F.edge_thermal_blur_strength), 0, 255)},
+            {"threads", std::clamp(static_cast<int>(F.edge_thermal_threads), 0, 4)},
           };
         } else {
           jf["id"] = "unknown";
@@ -651,6 +671,27 @@ bool config_from_json_text(const std::string &text, persisted_config &c) {
               if (x < 0) x = 0;
               if (x > 255) x = 255;
               fc.thin_image_threshold = x;
+            }
+          } else if (id == "edgethermal") {
+            fc.id = FILTER_EDGE_THERMAL;
+            if (jf.contains("params") && jf["params"].is_object()) {
+              double st = jf["params"].value("gain", 3.0);
+              fc.edge_thermal_gain = (float)std::clamp(st, 0.0, 255.0);
+
+              int x = jf["params"].value("threshold", 8);
+              if (x < 0) x = 0;
+              if (x > 255) x = 255;
+              fc.edge_thermal_threshold = x;
+
+              int b = jf["params"].value("blur_strength", 1);
+              if (b < 0) b = 0;
+              if (b > 255) b = 255;
+              fc.edge_thermal_blur_strength = b;
+
+              int c = jf["params"].value("threads", 0);
+              if (c < 0) c = 0;
+              if (c > 4) c = 4;
+              fc.edge_thermal_threads = c;
             }
           } else {
             continue;

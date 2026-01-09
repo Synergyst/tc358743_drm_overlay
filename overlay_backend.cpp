@@ -215,7 +215,16 @@ json filter_registry_json() {
     f["params"] = {
       {"x_tiles", 8},           // 8..16
       {"y_tiles", 8},           // 8..16
-      {"clip_limit", 0.1},      // 0..255
+      {"clip_limit", 0.1},      // 0.1f..8.0f
+    };
+    filters.push_back(f);
+  }
+  {
+    json f;
+    f["id"] = "thin";
+    f["name"] = "Thin Image (Efficient Binary Image Thinning using Neighborhood Maps)";
+    f["params"] = {
+      {"threshold", 1},      // 0..255
     };
     filters.push_back(f);
   }
@@ -329,6 +338,11 @@ std::string config_to_json(const persisted_config &c_in) {
             {"x_tiles", std::clamp(static_cast<int>(F.clahe_x_tiles), 8, 16)},
             {"y_tiles", std::clamp(static_cast<int>(F.clahe_y_tiles), 8, 16)},
             {"clip_limit", std::clamp(F.clahe_clip_limit, 0.1f, 8.0f)},
+          };
+        } else if (F.id == FILTER_THIN_IMAGE) {
+          jf["id"] = "thin";
+          jf["params"] = {
+            {"threshold", std::clamp(static_cast<int>(F.thin_image_threshold), 0, 255)},
           };
         } else {
           jf["id"] = "unknown";
@@ -629,6 +643,14 @@ bool config_from_json_text(const std::string &text, persisted_config &c) {
 
               double st = jf["params"].value("clip_limit", 0.1);
               fc.clahe_clip_limit = (float)std::clamp(st, 0.0, 8.0);
+            }
+          } else if (id == "thin") {
+            fc.id = FILTER_THIN_IMAGE;
+            if (jf.contains("params") && jf["params"].is_object()) {
+              int x = jf["params"].value("threshold", 1);
+              if (x < 0) x = 0;
+              if (x > 255) x = 255;
+              fc.thin_image_threshold = x;
             }
           } else {
             continue;

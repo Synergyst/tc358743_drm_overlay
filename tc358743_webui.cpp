@@ -694,6 +694,13 @@ const FILTER_FALLBACK = {
         { k:"clip_limit", type:"float", min:0.1, max:8.0, default:2.0 }
       ]
     },
+    {
+      id: "thin",
+      name: "Efficient Binary Image Thinning using Neighborhood Maps",
+      params: [
+        { k:"threshold", type:"int", min:0, max:255, default:1 },
+      ]
+    },
   ]
 };
 function schemaForKnownFilterId(id){
@@ -704,6 +711,7 @@ function schemaForKnownFilterId(id){
   if (id === 'rgbKeyAlpha') return FILTER_FALLBACK.filters[4].params;
   if (id === 'm3liteEdgeMask') return FILTER_FALLBACK.filters[5].params;
   if (id === 'clahe') return FILTER_FALLBACK.filters[6].params;
+  if (id === 'thin') return FILTER_FALLBACK.filters[7].params;
   return [];
 }
 function normalizeFilterDef(def){

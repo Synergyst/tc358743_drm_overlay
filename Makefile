@@ -121,7 +121,7 @@ endif
 
 all: deps $(TARGET)
 	@echo "[build] built: ./$(TARGET)"
-	strip --strip-unneeded ./$(TARGET)
+	#strip --strip-unneeded ./$(TARGET)
 
 deps: $(HTTPLIB_H) $(JSON_HPP)
 

@@ -42,6 +42,8 @@
 #include "oak_accel.h"
 #define BYTE_IMAGE
 #include "clahe.h"
+#include <cstdint>
+#include "thin_image.h"
 #include "gpu_clahe.h"
 
 using nlohmann::json;
@@ -1814,6 +1816,117 @@ static void filter_apply_clahe(layer_buf &buf, uint8_t x_tiles, uint8_t y_tiles,
     }
 }*/
 
+// threshold: luma >= threshold => foreground
+static void filter_apply_thin_image(layer_buf& buf, uint8_t threshold) {
+    if (buf.w == 0 || buf.h == 0 || buf.px.empty()) return;
+
+    const size_t n = (size_t)buf.w * (size_t)buf.h;
+
+    // Per-thread scratch to avoid races in a multi-threaded pipeline
+    thread_local std::vector<uint8_t> bin;
+    if (bin.size() != n) bin.resize(n);
+
+    // Build binary mask from XRGB8888
+    for (size_t i = 0; i < n; i++) {
+        const uint32_t p = buf.px[i]; // 0xXXRRGGBB
+        const uint32_t r = (p >> 16) & 0xFF;
+        const uint32_t g = (p >>  8) & 0xFF;
+        const uint32_t b = (p >>  0) & 0xFF;
+        const uint8_t  y = (uint8_t)((r*77 + g*150 + b*29 + 128) >> 8);
+        bin[i] = (y >= threshold) ? 255 : 0;
+    }
+
+    // Thin (8-bit, tight stride)
+    thinimg::ThinImageBinaryInPlace(bin.data(), (int)buf.w, (int)buf.h, (int)buf.w);
+
+    // Overlay skeleton as white; preserve top byte exactly
+    for (size_t i = 0; i < n; i++) {
+        if (bin[i]) buf.px[i] = (buf.px[i] & 0xFF000000u) | 0x00FFFFFFu;
+    }
+}
+
+/*static void filter_apply_thin_image(layer_buf& buf, uint8_t threshold) {
+    if (buf.w <= 0 || buf.h <= 0) return;
+
+    const size_t n = (size_t)buf.w * (size_t)buf.h;
+    if (buf.px.size() < n) return;
+
+    // IMPORTANT: avoid static shared scratch if filters can run on multiple threads
+    thread_local std::vector<uint8_t> bin;
+    bin.assign(n, 0);
+
+    // XRGB8888 -> binary (0/255)
+    for (size_t i = 0; i < n; i++) {
+        const uint32_t p = buf.px[i];              // 0xXXRRGGBB
+        const uint32_t r = (p >> 16) & 0xFF;
+        const uint32_t g = (p >>  8) & 0xFF;
+        const uint32_t b = (p >>  0) & 0xFF;
+        const uint8_t  y = (uint8_t)((r*77 + g*150 + b*29 + 128) >> 8);
+        bin[i] = (y >= threshold) ? 255 : 0;
+    }
+
+    // Thin 8-bit binary image (tight stride)
+    thinimg::ThinImageBinaryInPlace(bin.data(), buf.w, buf.h, buf.w);
+
+    // Overlay skeleton as white, preserve top byte
+    for (size_t i = 0; i < n; i++) {
+        if (bin[i]) {
+            const uint32_t x = buf.px[i] & 0xFF000000u;
+            buf.px[i] = x | 0x00FFFFFFu;
+        }
+    }
+}*/
+
+// Example: thin bright pixels and draw skeleton in white over original
+/*static inline void filter_apply_thin_image(layer_buf &buf, uint8_t threshold) {
+    if (buf.w <= 0 || buf.h <= 0 || buf.px.empty()) return;
+
+    const size_t n = (size_t)buf.w * (size_t)buf.h;
+
+    // 1) Build binary mask (0 or 255)
+    std::vector<uint8_t> bin(n);
+    for (size_t i = 0; i < n; i++) {
+        uint8_t y = luma_u8_from_xrgb(buf.px[i]);
+        bin[i] = (y >= threshold) ? 255 : 0;
+    }
+
+    // 2) Thin in place (stride = width for tightly packed 8-bit)
+    thinimg::ThinImageBinaryInPlace(
+        bin.data(),
+        buf.w,
+        buf.h,
+        buf.w,
+        nullptr // or provide a lambda to log passes
+    );
+
+    // 3) Composite result back (example: set thinned pixels to white)
+    for (size_t i = 0; i < n; i++) {
+        if (bin[i]) {
+            buf.px[i] = 0xFFFFFFFFu; // white skeleton
+        }
+    }
+}*/
+
+/*static void filter_apply_thin_image(layer_buf &buf, uint8_t x_tiles, uint8_t y_tiles, float clip_limit) {
+    if (buf.w < 16 || buf.h < 16) return;
+
+    // 1. Extract Luminance (8-bit)
+    std::vector<uint8_t> lum(buf.w * buf.h);
+    for (size_t i = 0; i < buf.px.size(); i++) {
+        lum[i] = luma_u8_from_xrgb(buf.px[i]);
+    }
+
+    // 2. Apply thin_image
+    //
+
+    // 3. Write back to Framebuffer
+    for (size_t i = 0; i < buf.px.size(); i++) {
+        uint8_t l = lum[i];
+        // Re-pack as XRGB (Grayscale look for "realistic" hallway)
+        buf.px[i] = 0xFF000000u | (l << 16) | (l << 8) | l;
+    }
+}*/
+
 static void apply_filter_chain(layer_buf &buf, const std::vector<filter_cfg> &filters) {
   for (const auto &f : filters) {
     if (f.id == FILTER_MONO) {
@@ -1834,6 +1947,8 @@ static void apply_filter_chain(layer_buf &buf, const std::vector<filter_cfg> &fi
       filter_apply_m3lite_edge_mask(buf);
     } else if (f.id == FILTER_CLAHE) {
       filter_apply_clahe(buf, f.clahe_x_tiles, f.clahe_y_tiles, f.clahe_clip_limit);
+    } else if (f.id == FILTER_THIN_IMAGE) {
+      filter_apply_thin_image(buf, f.thin_image_threshold);
     }
   }
 }

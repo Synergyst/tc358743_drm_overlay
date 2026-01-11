@@ -62,6 +62,9 @@ void webui_set_v4l2_caps_provider(std::string (*fn)(const std::string &dev)) {
   g_v4l2_caps = fn;
 }
 
+// Make sure this declaration is visible (put near the top if you prefer)
+void install_live_stream_endpoints(httplib::Server& svr);
+
 /*
   Notes re: per-layer filter stacks (video layers only for now):
   - UI stores filters as: layer.filters = [{id, enabled, params}, ...]
@@ -240,8 +243,9 @@ static const char *kIndexHtml = R"HTML(<!doctype html>
     </div>
     <div class="bd">
       <div class="viewportWrap" id="vpWrap">
-        <div class="checker"></div>
-        <img id="refImg" src="/ref.png" />
+        <!--<div class="checker"></div>-->
+        <!--<img id="refImg" src="/ref.png" />-->
+        <img id="refImg" src="/stream.mjpeg" />
         <svg id="xhPreview"></svg>
         <div id="overlayStage"></div>
       </div>
@@ -541,6 +545,13 @@ static const char *kIndexHtml = R"HTML(<!doctype html>
     </div>
   </div>
 </div>
+<script>
+  (() => {
+    const img = document.getElementById('refImg');
+    const base = '/stream.mjpeg';
+    img.src = base + '?t=' + Date.now();
+  })();
+</script>
 <script>
 const LIMITS = {
   opacity: {min:0, max:1},
@@ -2156,46 +2167,45 @@ void webui_start_detached(int port) {
       res.set_content(fn(dev), "application/json");
     });
 
-svr.Get("/stream.mjpeg", [](const httplib::Request&, httplib::Response &res) {
-    res.set_content_provider(
-        "multipart/x-mixed-replace; boundary=frame",
-        [](size_t offset, httplib::DataSink &sink) {
-            uint64_t last_sent_seq = 0;
+    svr.Get("/stream.mjpeg", [](const httplib::Request&, httplib::Response &res) {
+      res.set_content_provider("multipart/x-mixed-replace; boundary=frame", [](size_t offset, httplib::DataSink &sink) {
+        uint64_t last_sent_seq = 0;
+        while (true) {
+          std::vector<uint8_t> frame_to_send;
+          // 1. Wait for a new frame
+          {
+            std::unique_lock<std::mutex> lk(g_frame_mtx);
+            g_frame_cv.wait(lk, [&] {
+              return g_frame_sequence > last_sent_seq || (g_quit && g_quit->load());
+            });
 
-            while (true) {
-                std::vector<uint8_t> frame_to_send;
-
-                // 1. Wait for a new frame
-                {
-                    std::unique_lock<std::mutex> lk(g_frame_mtx);
-                    g_frame_cv.wait(lk, [&] { 
-                        return g_frame_sequence > last_sent_seq || (g_quit && g_quit->load()); 
-                    });
-
-                    if (g_quit && g_quit->load()) return false; // Exit if server shutting down
-
-                    frame_to_send = g_current_mjpeg_frame;
-                    last_sent_seq = g_frame_sequence;
-                }
-
-                // 2. Format the MJPEG chunk
-                std::string header = 
-                    "--frame\r\n"
-                    "Content-Type: image/jpeg\r\n"
-                    "Content-Length: " + std::to_string(frame_to_send.size()) + "\r\n\r\n";
-
-                // 3. Push to client
-                if (!sink.write(header.data(), header.size())) return false;
-                if (!sink.write(reinterpret_cast<const char*>(frame_to_send.data()), frame_to_send.size())) return false;
-                if (!sink.write("\r\n", 2)) return false;
-
-                // If sink.is_writable() returns false, the client likely disconnected
-                if (sink.is_writable && !sink.is_writable()) return false;
+            if (g_quit && g_quit->load()) return false; // Exit if server shutting down
+              frame_to_send = g_current_mjpeg_frame;
+              last_sent_seq = g_frame_sequence;
             }
-            return true;
+
+            // 2. Format the MJPEG chunk
+            std::string header = "--frame\r\nContent-Type: image/jpeg\r\nContent-Length: " + std::to_string(frame_to_send.size()) + "\r\n\r\n";
+
+            // 3. Push to client
+            if (!sink.write(header.data(), header.size())) return false;
+            if (!sink.write(reinterpret_cast<const char*>(frame_to_send.data()), frame_to_send.size())) return false;
+            if (!sink.write("\r\n", 2)) return false;
+
+            // If sink.is_writable() returns false, the client likely disconnected
+            if (sink.is_writable && !sink.is_writable()) return false;
+          }
+          return true;
         }
-    );
-});
+      );
+    });
+
+    // Register MJPEG + viewer routes
+    install_live_stream_endpoints(svr);
+
+    svr.Get("/__ping", [](const httplib::Request&, httplib::Response& res) {
+      res.set_content("ok\n", "text/plain");
+    });
 
     svr.Post("/api/apply", [](const httplib::Request &req, httplib::Response &res) {
       bool (*apply)(const std::string&, std::string&, int&) = nullptr;

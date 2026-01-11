@@ -46,6 +46,10 @@
 #include <cstdint>
 #include "thin_image.h"
 #include "gpu_clahe.h"
+//#include "layer_buf.h"
+#include "HumanOutline.h"
+
+HumanOutlineProcessor outlineProcessor;
 
 using nlohmann::json;
 
@@ -100,7 +104,7 @@ bool encode_frame_to_jpeg(void* src_map, int w, int h, int pitch, std::vector<ui
     // TJPF_BGRX is usually the correct mapping for DRM_FORMAT_XRGB8888
     // on little-endian systems (Byte 0=B, 1=G, 2=R, 3=X).
     // Using 'pitch' instead of '0' handles row padding correctly.
-    int status = tjCompress2(compressor, static_cast<unsigned char*>(src_map), w, pitch, h, TJPF_BGRX, &dest_buf, &dest_size, TJSAMP_420, 80, TJFLAG_FASTDCT);
+    int status = tjCompress2(compressor, static_cast<unsigned char*>(src_map), w, pitch, h, TJPF_BGRX, &dest_buf, &dest_size, TJSAMP_420, 93, TJFLAG_FASTDCT);
 
     if (status == 0) {
         out_jpeg.assign(dest_buf, dest_buf + dest_size);
@@ -777,14 +781,14 @@ static inline void clear_xrgb_rows_fast(uint8_t *dst_xrgb, uint32_t dst_stride, 
 }
 
 // ---------------- Minimal filters (unchanged core) ----------------
-struct layer_buf {
+/*struct layer_buf {
   uint32_t w=0, h=0;
   std::vector<uint32_t> px;
   void resize(uint32_t W, uint32_t H) {
     w=W; h=H;
     px.resize((size_t)w*(size_t)h);
   }
-};
+};*/
 
 // ---------------- OAK global state ----------------
 static std::mutex g_oak_mtx;
@@ -1660,9 +1664,11 @@ static void filter_apply_m3lite_edge_mask(layer_buf &buf) {
   const float   sobel2_alpha     = 1.0f;  // edgesOnly alpha
   const bool    sobel_invert     = false;
 
-  const uint8_t edge_on_threshold = 24;   // after double-sobel, consider this “edge present”
-  const int     thicken_radius = 1;       // 1 => 3x3 dilation (thicker lines)
+  const uint8_t edge_on_threshold = 22;   // after double-sobel, consider this “edge present”
+  const int     thicken_radius = 2;       // 1 => 3x3 dilation (thicker lines)
   const uint8_t out_a = 64;               // alpha for green lines
+
+  const bool enable_denoise = true;       // hardcoded toggle for now
   // ------------------------------------------
 
   // 1) Sobel magnitude (writes opaque grayscale into buf) [4]
@@ -1681,6 +1687,29 @@ static void filter_apply_m3lite_edge_mask(layer_buf &buf) {
     uint8_t y = (uint8_t)((p >> 16) & 0xFF); // Sobel output is grayscale, so R==G==B [4]
     // Treat any transparent pixel as not-an-edge, regardless of RGB.
     m[i] = (a != 0 && y >= edge_on_threshold) ? 255 : 0;
+  }
+
+  // 3.5) Optional denoise: remove salt/pepper in the *binary* edge mask.
+  // This is a cheap majority filter (3x3): kill isolated single pixels and tiny specks.
+  if (enable_denoise) {
+    filter_apply_sobel(buf, filter_cfg::SOBEL_EDGES_ONLY, 238, sobel2_alpha, sobel_invert);
+    std::vector<uint8_t> mn = m;
+    for (uint32_t y = 1; y + 1 < h; y++) {
+      for (uint32_t x = 1; x + 1 < w; x++) {
+        int on = 0;
+        const size_t idx = (size_t)y * (size_t)w + (size_t)x;
+        for (int dy = -1; dy <= 1; dy++) {
+          const uint8_t* row = &m[((size_t)(y + dy)) * (size_t)w];
+          for (int dx = -1; dx <= 1; dx++) {
+            on += (row[x + dx] != 0);
+          }
+        }
+        // Keep pixel only if it has enough support in its neighborhood.
+        // 5+ out of 9 is a good default for suppressing speckle.
+        mn[idx] = (on >= 8) ? 255 : 0;
+      }
+    }
+    m.swap(mn);
   }
 
   // 4) Thicken lines via dilation on the mask (radius 1 is a 3x3 max filter)
@@ -1873,155 +1902,107 @@ static void filter_apply_thin_image(layer_buf& buf, uint8_t threshold) {
 }
 
 // Edge detect tuned for low-contrast thermal imagery:
-// 1) fast local contrast normalization via (approx) 3x3 box blur subtraction
-// 2) Scharr gradient magnitude on the high-passed image (better than Sobel for weak edges)
-// 3) optional soft threshold + gain
-//
 // Input/Output: layer_buf XRGB8888 (0xXXRRGGBB). Preserves the top byte (XX).
 // Output: edges as white on black by default (RGB), but you can change composition easily.
-static void filter_apply_edge_thermal(layer_buf& buf,
-                                      float gain = 3.0f,
-                                      uint8_t threshold = 8,
-                                      uint8_t blur_strength = 1,
-                                      uint8_t threads = 1) {
+/*static void filter_apply_edge_thermal(layer_buf& buf, float gain = 3.0f, uint8_t threshold = 8, uint8_t blur_strength = 1, uint8_t threads = 1) {
   if (buf.w < 3 || buf.h < 3 || buf.px.empty()) return;
 
   const int w = (int)buf.w, h = (int)buf.h;
   const size_t n = (size_t)w * (size_t)h;
   if (buf.px.size() != n) return; // with your layer_buf, this should always match
 
-  gain = std::max(0.0f, gain);
+  // Reuse your names; internally this is now "outline extraction tuning".
+  // gain:     sensitivity / strength (0.01..255)
+  // threshold:binary cutoff (0..255)
+  // blur_strength: denoise amount (0..255)
+  // threads:  0..4 OpenCV thread hint
+  threads = 1;
+  outlineProcessor.process(buf, gain, threshold, blur_strength, threads, 2);
+}*/
 
-  /*if (threads == 0) {
-    unsigned hc = std::thread::hardware_concurrency();
-    threads = hc ? hc : 4;
-  }
-  threads = std::max(1u, threads);*/
-  //threads = 1;
+static void filter_apply_edge_thermal(layer_buf& buf,
+                                      float gain = 3.0f,
+                                      uint8_t threshold = 8,
+                                      uint8_t blur_strength = 1,
+                                      uint8_t threads = 1) {
+  (void)threads; // placeholder until you wire this up
+  if (buf.w < 3 || buf.h < 3 || buf.px.empty()) return;
 
-  auto clamp_u8 = [](int v) -> uint8_t { return (uint8_t)std::clamp(v, 0, 255); };
+  const uint32_t w = buf.w, h = buf.h;
+  const size_t n = (size_t)w * (size_t)h;
+  if (buf.px.size() != n) return;
 
-  // IMPORTANT: Do NOT use thread_local scratch here if your filter can be re-entered on the same thread
-  // (common with nested compositing / callbacks). Instead, allocate locally per call.
-  // This costs allocations; you can replace with a per-layer scratch cache later.
-  std::vector<uint8_t> Y(n), B(n), HP(n), E(n);
+  // Hardcoded toggle for now (you said you'll parameterize later)
+  const bool enable_denoise = true;
 
-  auto luma_u8 = [](uint32_t p) -> uint8_t {
-    const uint32_t r = (p >> 16) & 0xFF;
-    const uint32_t g = (p >>  8) & 0xFF;
-    const uint32_t b = (p >>  0) & 0xFF;
-    return (uint8_t)((r*77 + g*150 + b*29 + 128) >> 8);
-  };
+  // Reuse existing variable names:
+  const float gain_factor = gain;      // 0.01f..255.0f
+  const uint8_t edge_on_threshold = threshold; // 0..255
 
-  auto parallel_rows = [&](int y0, int y1, auto&& fn) {
-    const int total = y1 - y0;
-    const int chunk = (total + (int)threads - 1) / (int)threads;
-    std::vector<std::thread> ts;
-    ts.reserve(threads);
-    for (unsigned t = 0; t < threads; t++) {
-      int a = y0 + (int)t * chunk;
-      int b = std::min(y1, a + chunk);
-      if (a >= b) break;
-      ts.emplace_back([=, &fn]() { fn(a, b); });
-    }
-    for (auto& th : ts) th.join();
-  };
+  // Build a binary-ish edge mask from current buffer’s luma (use R).
+  std::vector<uint8_t> m(n, 0);
+  for (size_t i = 0; i < n; i++) {
+    uint32_t p = buf.px[i];
+    uint8_t a = (uint8_t)((p >> 24) & 0xFF);
+    uint8_t y = (uint8_t)((p >> 16) & 0xFF); // treat R as luma
 
-  // 1) XRGB8888 -> GRAY8
-  parallel_rows(0, h, [&](int ya, int yb) {
-    for (int y = ya; y < yb; y++) {
-      const uint32_t* src = buf.px.data() + (size_t)y * (size_t)w;
-      uint8_t* dst = Y.data() + (size_t)y * (size_t)w;
-      for (int x = 0; x < w; x++) dst[x] = luma_u8(src[x]);
-    }
-  });
+    int yg = (int)((float)y * gain_factor);
+    if (yg > 255) yg = 255;
+    if (yg < 0)   yg = 0;
 
-  // 2) Blur/high-pass for low contrast (blur_strength==0 disables)
-  if (blur_strength) {
-    // 3x3 box blur
-    parallel_rows(0, h, [&](int ya, int yb) {
-      for (int y = ya; y < yb; y++) {
-        const int ym1 = (y > 0) ? (y - 1) : y;
-        const int yp1 = (y + 1 < h) ? (y + 1) : y;
-
-        const uint8_t* r0 = Y.data() + (size_t)ym1 * (size_t)w;
-        const uint8_t* r1 = Y.data() + (size_t)y   * (size_t)w;
-        const uint8_t* r2 = Y.data() + (size_t)yp1 * (size_t)w;
-
-        uint8_t* out = B.data() + (size_t)y * (size_t)w;
-
-        for (int x = 0; x < w; x++) {
-          const int xm1 = (x > 0) ? (x - 1) : x;
-          const int xp1 = (x + 1 < w) ? (x + 1) : x;
-          const int sum =
-            r0[xm1] + r0[x] + r0[xp1] +
-            r1[xm1] + r1[x] + r1[xp1] +
-            r2[xm1] + r2[x] + r2[xp1];
-          out[x] = (uint8_t)((sum + 4) / 9);
-        }
-      }
-    });
-
-    // High-pass centered at 128
-    parallel_rows(0, h, [&](int ya, int yb) {
-      for (int y = ya; y < yb; y++) {
-        const uint8_t* a = Y.data() + (size_t)y * (size_t)w;
-        const uint8_t* b = B.data() + (size_t)y * (size_t)w;
-        uint8_t* o = HP.data() + (size_t)y * (size_t)w;
-        for (int x = 0; x < w; x++) {
-          int v = (int)a[x] - (int)b[x] + 128;
-          o[x] = (uint8_t)std::clamp(v, 0, 255);
-        }
-      }
-    });
-  } else {
-    HP = Y;
+    m[i] = (a != 0 && (uint8_t)yg >= edge_on_threshold) ? 255 : 0;
   }
 
-  // 3) Scharr edges on HP
-  parallel_rows(0, h, [&](int ya, int yb) {
-    for (int y = ya; y < yb; y++) {
-      const int ym1 = (y > 0) ? (y - 1) : y;
-      const int yp1 = (y + 1 < h) ? (y + 1) : y;
-
-      const uint8_t* r0 = HP.data() + (size_t)ym1 * (size_t)w;
-      const uint8_t* r1 = HP.data() + (size_t)y   * (size_t)w;
-      const uint8_t* r2 = HP.data() + (size_t)yp1 * (size_t)w;
-
-      uint8_t* out = E.data() + (size_t)y * (size_t)w;
-
-      for (int x = 0; x < w; x++) {
-        const int xm1 = (x > 0) ? (x - 1) : x;
-        const int xp1 = (x + 1 < w) ? (x + 1) : x;
-
-        const int a = r0[xm1], b0 = r0[x], c = r0[xp1];
-        const int d = r1[xm1],           f = r1[xp1];
-        const int g0 = r2[xm1], h0 = r2[x], i0 = r2[xp1];
-
-        const int gx = ( 3*c + 10*f + 3*i0) - ( 3*a + 10*d + 3*g0);
-        const int gy = ( 3*g0 + 10*h0 + 3*i0) - ( 3*a + 10*b0 + 3*c);
-
-        int mag = std::abs(gx) + std::abs(gy);
-        mag = (int)std::lround((double)mag * (double)gain / 16.0);
-        mag = (mag > (int)threshold) ? (mag - (int)threshold) : 0;
-
-        out[x] = clamp_u8(mag);
+  // Optional: remove salt/pepper in the binary mask (3x3 majority)
+  if (enable_denoise) {
+    std::vector<uint8_t> mn = m;
+    for (uint32_t yy = 1; yy + 1 < h; yy++) {
+      for (uint32_t xx = 1; xx + 1 < w; xx++) {
+        int on = 0;
+        const size_t idx = (size_t)yy * (size_t)w + (size_t)xx;
+        for (int dy = -1; dy <= 1; dy++) {
+          const uint8_t* row = &m[((size_t)(yy + dy)) * (size_t)w];
+          for (int dx = -1; dx <= 1; dx++) {
+            on += (row[xx + dx] != 0);
+          }
+        }
+        mn[idx] = (on >= 5) ? 255 : 0;
       }
     }
-  });
+    m.swap(mn);
+  }
 
-  // 4) Write back as grayscale edges, preserve top byte
-  parallel_rows(0, h, [&](int ya, int yb) {
-    for (int y = ya; y < yb; y++) {
-      uint32_t* dst = buf.px.data() + (size_t)y * (size_t)w;
-      const uint8_t* src = E.data() + (size_t)y * (size_t)w;
-      for (int x = 0; x < w; x++) {
-        const uint32_t top = dst[x] & 0xFF000000u;
-        const uint32_t v = (uint32_t)src[x];
-        dst[x] = top | (v << 16) | (v << 8) | v;
+  // Optional: thicken edges.
+  // Reuse blur_strength as "thicken radius" for now (0..255 -> 0..3)
+  int thicken_radius = (int)(blur_strength / 85); // 0,1,2,3
+  if (thicken_radius > 0) {
+    std::vector<uint8_t> md = m;
+    const int r = thicken_radius;
+    for (uint32_t yy = 0; yy < h; yy++) {
+      for (uint32_t xx = 0; xx < w; xx++) {
+        uint8_t mx = 0;
+        for (int dy = -r; dy <= r; dy++) {
+          int y2 = (int)yy + dy;
+          if (y2 < 0 || y2 >= (int)h) continue;
+          const uint8_t* row = &m[(size_t)y2 * (size_t)w];
+          for (int dx = -r; dx <= r; dx++) {
+            int x2 = (int)xx + dx;
+            if (x2 < 0 || x2 >= (int)w) continue;
+            uint8_t v = row[x2];
+            if (v > mx) mx = v;
+          }
+        }
+        md[(size_t)yy * (size_t)w + (size_t)xx] = mx;
       }
     }
-  });
+    m.swap(md);
+  }
+
+  // Write final output: green where mask is on, else transparent.
+  const uint8_t out_a = 64;
+  for (size_t i = 0; i < n; i++) {
+    buf.px[i] = m[i] ? (((uint32_t)out_a << 24) | 0x0000FF00u) : 0x00000000u;
+  }
 }
 
 static void apply_filter_chain(layer_buf &buf, const std::vector<filter_cfg> &filters) {
@@ -3082,11 +3063,13 @@ struct pipeline {
 // 2. Prepare the frame for the Web UI
 // Note: We do this AFTER the flip call so we don't delay the HDMI sync
 {
-    // A. Encode the raw pixels to JPEG
-    // You will need a helper function here (see below)
     std::vector<uint8_t> jpeg_buffer;
-    // Use .map and .pitch from your struct
-    if (encode_frame_to_jpeg(fb[next].map, fb[next].width, fb[next].height, fb[next].pitch, jpeg_buffer)) {
+
+    if (encode_frame_to_jpeg(fb[next].map,
+                             fb[next].width,
+                             fb[next].height,
+                             fb[next].pitch,
+                             jpeg_buffer)) {
         {
             std::lock_guard<std::mutex> lk(g_frame_mtx);
             g_current_mjpeg_frame = std::move(jpeg_buffer);

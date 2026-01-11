@@ -13,6 +13,8 @@ TARGET := tc358743_drm_present_main
 
 SRCS := \
     tc358743_drm_present_main.cpp \
+    tc358743_webui_stream_endpoints.cpp \
+    tc358743_webui_globals.cpp \
     tc358743_webui.cpp \
     overlay_backend.cpp \
     v4l2_caps.cpp \

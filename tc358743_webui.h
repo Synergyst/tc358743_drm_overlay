@@ -26,7 +26,7 @@ void webui_set_v4l2_caps_provider(std::string (*fn)(const std::string &dev));
 void webui_start_detached(int port);
 
 // Live feed
-static std::mutex g_frame_mtx;
-static std::condition_variable g_frame_cv;
-static std::vector<uint8_t> g_current_mjpeg_frame;
-static uint64_t g_frame_sequence = 0; // To track if a frame is actually "new"
+extern std::mutex g_frame_mtx;
+extern std::condition_variable g_frame_cv;
+extern std::vector<uint8_t> g_current_mjpeg_frame;
+extern uint64_t g_frame_sequence; // To track if a frame is actually "new"

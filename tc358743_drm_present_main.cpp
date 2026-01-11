@@ -3751,8 +3751,16 @@ std::thread oled_thr;
 
   // optional: show more fields / GPS / video devices
   snprintf(ocfg.fields_arg, sizeof(ocfg.fields_arg), "%s", "psu,load,curr,power,pct,vid,fmt,utc_time,local_time,lat,lon");
-  //snprintf(ocfg.video_devs, sizeof(ocfg.video_devs), "%s", "/dev/v4l/by-path/platform-fe800000.csi-video-index0");
-  snprintf(ocfg.video_devs, sizeof(ocfg.video_devs), "%s", "/dev/video0");
+  // 1. Resolve and allocate memory automatically
+  char* resolved = realpath("/dev/v4l/by-path/platform-fe800000.csi-video-index0", NULL);
+  if (resolved) {
+    // 2. Copy the resolved string (e.g., "/dev/video0") to your config
+    snprintf(ocfg.video_devs, sizeof(ocfg.video_devs), "%s", resolved);
+    // 3. Free the memory allocated by realpath
+    free(resolved);
+  } else {
+    snprintf(ocfg.video_devs, sizeof(ocfg.video_devs), "%s", "/dev/video0");
+  }
   snprintf(ocfg.nmea_arg, sizeof(ocfg.nmea_arg), "%s", "/dev/ttyS0,115200,1");
   snprintf(ocfg.tz_arg, sizeof(ocfg.tz_arg), "%s", "CST6CDT");
 

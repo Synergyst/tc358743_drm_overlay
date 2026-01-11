@@ -30,6 +30,8 @@
 #include <mutex>
 #include <string>
 #include <thread>
+#include <stdarg.h>
+#include "ssd1306_app.h"
 #include <vector>
 #include <sstream>
 #include <fstream>
@@ -104,7 +106,7 @@ bool encode_frame_to_jpeg(void* src_map, int w, int h, int pitch, std::vector<ui
     // TJPF_BGRX is usually the correct mapping for DRM_FORMAT_XRGB8888
     // on little-endian systems (Byte 0=B, 1=G, 2=R, 3=X).
     // Using 'pitch' instead of '0' handles row padding correctly.
-    int status = tjCompress2(compressor, static_cast<unsigned char*>(src_map), w, pitch, h, TJPF_BGRX, &dest_buf, &dest_size, TJSAMP_420, 93, TJFLAG_FASTDCT);
+    int status = tjCompress2(compressor, static_cast<unsigned char*>(src_map), w, pitch, h, TJPF_BGRX, &dest_buf, &dest_size, TJSAMP_420, 43, TJFLAG_FASTDCT);
 
     if (status == 0) {
         out_jpeg.assign(dest_buf, dest_buf + dest_size);
@@ -839,6 +841,89 @@ static bool cfg_wants_oak_pipeline(const persisted_config& cfg) {
     if (L.oak.role != OAK_NONE) return true; // includes OUTPUT and inputs
   }
   return false;
+}
+
+void convertLimitedToFull(layer_buf& buf) {
+    // Scaling factor: 255 / (235 - 16) = 255 / 219 ≈ 1.16438
+    const float scale = 255.0f / 219.0f;
+
+    for (uint32_t& pixel : buf.px) {
+        // 1. Extract channels (assuming ARGB/XRGB: 0xAARRGGBB)
+        uint8_t a = (pixel >> 24) & 0xFF;
+        uint8_t r = (pixel >> 16) & 0xFF;
+        uint8_t g = (pixel >> 8)  & 0xFF;
+        uint8_t b =  pixel        & 0xFF;
+
+        // 2. Apply conversion to R, G, and B
+        // Formula: (value - 16) * (255 / 219)
+        auto toFull = [scale](uint8_t val) -> uint8_t {
+            float result = (static_cast<float>(val) - 16.0f) * scale;
+            return static_cast<uint8_t>(std::clamp(result, 0.0f, 255.0f));
+        };
+
+        r = toFull(r);
+        g = toFull(g);
+        b = toFull(b);
+
+        // 3. Repack into the 32-bit pixel (keeping original Alpha)
+        pixel = (static_cast<uint32_t>(a) << 24) |
+                (static_cast<uint32_t>(r) << 16) |
+                (static_cast<uint32_t>(g) << 8)  |
+                (static_cast<uint32_t>(b));
+    }
+}
+
+void convertLimitedToFullFast(layer_buf& buf) {
+    static uint8_t lut[256];
+    static bool init = false;
+    if (!init) {
+        for (int i = 0; i < 256; ++i) {
+            float res = (i - 16.0f) * (255.0f / 219.0f);
+            lut[i] = static_cast<uint8_t>(std::clamp(res, 0.0f, 255.0f));
+        }
+        init = true;
+    }
+
+    for (uint32_t& pixel : buf.px) {
+        pixel = (pixel & 0xFF000000) |           // Keep Alpha
+                (lut[(pixel >> 16) & 0xFF] << 16) | // Red
+                (lut[(pixel >> 8)  & 0xFF] << 8)  | // Green
+                (lut[pixel & 0xFF]);                // Blue
+    }
+}
+
+/**
+ * Converts Limited RGB (16-235) to Full RGB (0-255) for XRGB8888.
+ * Skips the Alpha/X channel entirely.
+ */
+void convertLimitedToFullXRGB(layer_buf& buf) {
+    // 1. Initialize the Lookup Table (LUT) once
+    static uint8_t lut[256];
+    static bool lut_ready = false;
+
+    if (!lut_ready) {
+        const float scale = 255.0f / 219.0f; // Range is 235 - 16 = 219
+        for (int i = 0; i < 256; ++i) {
+            float res = (static_cast<float>(i) - 16.0f) * scale;
+            lut[i] = static_cast<uint8_t>(std::clamp(res, 0.0f, 255.0f));
+        }
+        lut_ready = true;
+    }
+
+    // 2. Process pixels
+    for (uint32_t& pixel : buf.px) {
+        // Extract channels assuming 0xXXRRGGBB
+        uint8_t r = (pixel >> 16) & 0xFF;
+        uint8_t g = (pixel >> 8)  & 0xFF;
+        uint8_t b =  pixel        & 0xFF;
+
+        // Repack:
+        // (pixel & 0xFF000000) -> Keeps the leading X/Alpha byte exactly as is
+        pixel = (pixel & 0xFF000000) |
+                (static_cast<uint32_t>(lut[r]) << 16) |
+                (static_cast<uint32_t>(lut[g]) << 8)  |
+                (static_cast<uint32_t>(lut[b]));
+    }
 }
 
 // Convert layer_buf (XRGB8888) -> GRAY8 (luma)
@@ -1932,8 +2017,10 @@ static void filter_apply_edge_thermal(layer_buf& buf,
   const size_t n = (size_t)w * (size_t)h;
   if (buf.px.size() != n) return;
 
+  convertLimitedToFullXRGB(buf);
+
   // Hardcoded toggle for now (you said you'll parameterize later)
-  const bool enable_denoise = true;
+  /*const bool enable_denoise = true;
 
   // Reuse existing variable names:
   const float gain_factor = gain;      // 0.01f..255.0f
@@ -2002,7 +2089,7 @@ static void filter_apply_edge_thermal(layer_buf& buf,
   const uint8_t out_a = 64;
   for (size_t i = 0; i < n; i++) {
     buf.px[i] = m[i] ? (((uint32_t)out_a << 24) | 0x0000FF00u) : 0x00000000u;
-  }
+  }*/
 }
 
 static void apply_filter_chain(layer_buf &buf, const std::vector<filter_cfg> &filters) {
@@ -2709,7 +2796,8 @@ struct pipeline {
     cfg_normalize(cfg);
     memset(&fb[0],0,sizeof(fb[0]));
     memset(&fb[1],0,sizeof(fb[1]));
-    int cpu_count=(int)sysconf(_SC_NPROCESSORS_ONLN);
+    //int cpu_count=(int)sysconf(_SC_NPROCESSORS_ONLN);
+    int cpu_count=64;
     if (cpu_count<1) cpu_count=1;
     comp_threads = cfg.threads;
     if (comp_threads<=0) comp_threads=cpu_count;
@@ -3572,6 +3660,8 @@ int main(int argc, char **argv) {
 
   pipeline p;
   bool have_pipeline=false;
+  uint8_t restartCount = 0;
+  uint8_t restartMaxCount = 3;
   for (;;) {
     auto snap=cfg_snapshot();
     {
@@ -3580,7 +3670,16 @@ int main(int argc, char **argv) {
     }
     if (!present_policy_valid(snap.present_policy)) snap.present_policy="fit";
     if (p.init_from_config(snap)) { have_pipeline=true; break; }
-    fprintf(stderr, "[supervisor] pipeline init failed; retrying in 1s...\n");
+    if (restartCount < restartMaxCount) {
+      fprintf(stderr, "[supervisor] pipeline init failed; retrying in 1s...\n");
+    } else {
+      fprintf(stderr, "[supervisor] pipeline init failed; rebooting...\n");
+      p.shutdown();
+      usleep(1000*1000);
+      system("nohup reboot &");
+      break;
+    }
+    restartCount++;
     p.shutdown();
     usleep(1000*1000);
   }
@@ -3627,6 +3726,46 @@ int main(int argc, char **argv) {
     fprintf(stderr, "[webui] open http://<device-ip>:%d/\n", webui_port);
   }
 
+// ---- OLED background thread ----
+static volatile int g_oled_stop = 0;
+std::thread oled_thr;
+{
+  ssd1306_app_cfg_t ocfg;
+  ssd1306_app_cfg_init(&ocfg);
+
+  ocfg.stop_flag = &g_oled_stop;
+
+  // Choose mode
+  ocfg.power_meter = 1;
+  ocfg.video_monitor = 0;
+  ocfg.animate = 0;
+  ocfg.test_frame = 0;
+
+  // Hardware (adjust as needed)
+  ocfg.i2c_node_address = 1;
+  snprintf(ocfg.oled_type, sizeof(ocfg.oled_type), "%s", "128x64");
+
+  ocfg.ina_bus = 10;
+  ocfg.ina_addr = 0x43;
+  ocfg.ina_period_ms = 5000;
+
+  // optional: show more fields / GPS / video devices
+  snprintf(ocfg.fields_arg, sizeof(ocfg.fields_arg), "%s", "psu,load,curr,power,pct,vid,fmt,utc_time,local_time,lat,lon");
+  //snprintf(ocfg.video_devs, sizeof(ocfg.video_devs), "%s", "/dev/v4l/by-path/platform-fe800000.csi-video-index0");
+  snprintf(ocfg.video_devs, sizeof(ocfg.video_devs), "%s", "/dev/video0");
+  snprintf(ocfg.nmea_arg, sizeof(ocfg.nmea_arg), "%s", "/dev/ttyS0,115200,1");
+  snprintf(ocfg.tz_arg, sizeof(ocfg.tz_arg), "%s", "CST6CDT");
+
+  // Logging server inside OLED module
+  ocfg.log_tcp_enable = 1;
+  snprintf(ocfg.log_bind_ip, sizeof(ocfg.log_bind_ip), "%s", "0.0.0.0");
+  ocfg.log_port = 9090;
+
+  oled_thr = std::thread([ocfg]() mutable {
+    (void)ssd1306_app_run(&ocfg);
+  });
+}
+
   while (!g_quit.load()) {
     char ch;
     ssize_t n = read(STDIN_FILENO, &ch, 1);
@@ -3636,7 +3775,16 @@ int main(int argc, char **argv) {
       auto snap=cfg_snapshot();
       if (!present_policy_valid(snap.present_policy)) snap.present_policy="fit";
       if (!p.init_from_config(snap)) {
-        fprintf(stderr, "[supervisor] pipeline init failed; retrying in 1s...\n");
+        if (restartCount < restartMaxCount) {
+          fprintf(stderr, "[supervisor] pipeline init failed; retrying in 1s...\n");
+        } else {
+          fprintf(stderr, "[supervisor] pipeline init failed; rebooting...\n");
+          p.shutdown(); have_pipeline=false;
+          usleep(1000*1000);
+          system("nohup reboot &");
+        }
+        restartCount++;
+        //fprintf(stderr, "[supervisor] pipeline init failed; retrying in 1s...\n");
         p.shutdown(); have_pipeline=false;
         usleep(1000*1000);
         continue;
@@ -3674,6 +3822,8 @@ int main(int argc, char **argv) {
   }
 
   fprintf(stderr, "[main] shutting down...\n");
+  g_oled_stop = 1;
+  if (oled_thr.joinable()) oled_thr.join();
   p.shutdown();
   return 0;
 }

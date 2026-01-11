@@ -277,7 +277,7 @@ static const char *kIndexHtml = R"HTML(<!doctype html>
         </div>
       </div>
       <div style="margin-top:10px;" class="muted">
-        Reference frame captured once at startup. Preview is not live video.
+        Reference live video. MJPEG-compressed to optimize for latency, true quality is higher.
       </div>
     </div>
   </div>

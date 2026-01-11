@@ -31,6 +31,15 @@ HTTPLIB_URL := https://raw.githubusercontent.com/yhirose/cpp-httplib/v0.15.3/htt
 JSON_URL := https://raw.githubusercontent.com/nlohmann/json/v3.11.3/single_include/nlohmann/json.hpp
 
 CXX ?= g++
+CC ?= gcc
+
+SSD_DIR := .
+SSD_CSRC := \
+  ssd1306.c \
+  linux_i2c.c \
+  ssd1306_app.c
+
+SSD_OBJS := $(SSD_CSRC:.c=.o)
 
 # Default DepthAI paths (matching your script). Override on make command line if desired.
 DEPTHAI_INC ?= /media/FALCON/Luxonis/depthai-core/build/install/include
@@ -76,7 +85,11 @@ CXXFLAGS += \
     -I$(DEPTHAI_INC) \
     -I$(DEPTHAI_DEPS_INC) \
     -I$(DEPTHAI_THIRD_PARTY_INC) \
-	$(PKG_CFLAGS)
+    $(PKG_CFLAGS)
+CXXFLAGS += -I./$(SSD_DIR) -DNMEA_MINI_ENABLE_TZ
+
+CFLAGS ?=
+CFLAGS += -O3 -DNDEBUG -Wall -Wextra -pthread -ffunction-sections -fdata-sections -flto=auto -I./$(SSD_DIR) -DNMEA_MINI_ENABLE_TZ
 
 LDFLAGS ?=
 LDFLAGS += \
@@ -93,6 +106,7 @@ LDLIBS += \
     -lbz2 \
     -llzma \
     -ludev \
+    -lm \
     $(pkg-config --libs libjpeg libturbojpeg) \
     /usr/lib/aarch64-linux-gnu/libturbojpeg.a \
     $(DEPTHAI_LIB)/libdepthai-core.a \
@@ -141,7 +155,7 @@ $(JSON_HPP): | $(THIRD_PARTY_DIR)
 	@echo "[build] fetching nlohmann/json..."
 	@curl -L --fail -o "$@" "$(JSON_URL)"
 
-$(TARGET): $(OBJS)
+$(TARGET): $(OBJS) $(SSD_OBJS)
 	@echo "[build] linking..."
 	$(CXX) -o $@ $^ $(LDFLAGS) $(LDLIBS)
 
@@ -149,8 +163,12 @@ $(TARGET): $(OBJS)
 	@echo "[build] compiling $< ..."
 	$(CXX) $(CXXFLAGS) -c -o $@ $<
 
+%.o: %.c
+	@echo "[build] compiling C $< ..."
+	$(CC) $(CFLAGS) -c -o $@ $<
+
 clean:
-	@rm -f $(OBJS) $(TARGET)
+	@rm -f $(OBJS) $(SSD_OBJS) $(TARGET)
 
 distclean: clean
 	@rm -f $(HTTPLIB_H) $(JSON_HPP)

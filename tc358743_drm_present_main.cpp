@@ -489,6 +489,23 @@ static int find_hdmi_a_1(int drm_fd, uint32_t *out_conn_id, drmModeConnector **o
   drmModeFreeResources(res);
   return -1;
 }
+static int find_hdmi_a_2(int drm_fd, uint32_t *out_conn_id, drmModeConnector **out_conn) {
+  drmModeRes *res = drmModeGetResources(drm_fd);
+  if (!res) return -1;
+  for (int i=0;i<res->count_connectors;i++) {
+    drmModeConnector *c = drmModeGetConnector(drm_fd, res->connectors[i]);
+    if (!c) continue;
+    if (c->connector_type == DRM_MODE_CONNECTOR_HDMIA && c->connector_type_id == 2) {
+      *out_conn_id = c->connector_id;
+      *out_conn = c;
+      drmModeFreeResources(res);
+      return 0;
+    }
+    drmModeFreeConnector(c);
+  }
+  drmModeFreeResources(res);
+  return -1;
+}
 static int get_active_crtc_for_connector(int drm_fd, drmModeConnector *conn,
                                          uint32_t *out_crtc_id, uint32_t *out_crtc_index,
                                          uint32_t *out_w, uint32_t *out_h) {
@@ -2862,7 +2879,20 @@ struct pipeline {
     if (drm_fd < 0) { perror("open_vc4_card"); return false; }
     if (drmSetClientCap(drm_fd, DRM_CLIENT_CAP_ATOMIC, 1) != 0) return false;
 
-    if (find_hdmi_a_1(drm_fd, &conn_id, &conn) != 0) return false;
+    bool preferHeadsetPort = true;
+    if (preferHeadsetPort) {
+      if (find_hdmi_a_2(drm_fd, &conn_id, &conn) != 0) {
+        if (find_hdmi_a_1(drm_fd, &conn_id, &conn) != 0) {
+          return false;
+        }
+      }
+    } else {
+      if (find_hdmi_a_1(drm_fd, &conn_id, &conn) != 0) {
+        if (find_hdmi_a_2(drm_fd, &conn_id, &conn) != 0) {
+          return false;
+        }
+      }
+    }
     if (conn->connection != DRM_MODE_CONNECTED) return false;
 
     if (get_active_crtc_for_connector(drm_fd, conn, &crtc_id, &crtc_index, &out_w, &out_h) != 0) return false;
@@ -3147,26 +3177,19 @@ struct pipeline {
 
     if (!saw_frame) { fprintf(stderr, "[pipeline] first composited frame\n"); saw_frame=true; }
     if (drm_plane_flip_fb_only(drm_fd, plane_id, p_fb_id, fb[next].fb_id) != 0) return false;
-    // synergyst
-// 2. Prepare the frame for the Web UI
-// Note: We do this AFTER the flip call so we don't delay the HDMI sync
-{
-    std::vector<uint8_t> jpeg_buffer;
-
-    if (encode_frame_to_jpeg(fb[next].map,
-                             fb[next].width,
-                             fb[next].height,
-                             fb[next].pitch,
-                             jpeg_buffer)) {
+    // Prepare the frame for the Web UI
+    // Note: We do this AFTER the flip call so we don't delay the HDMI sync
+    {
+      std::vector<uint8_t> jpeg_buffer;
+      if (encode_frame_to_jpeg(fb[next].map, fb[next].width, fb[next].height, fb[next].pitch, jpeg_buffer)) {
         {
-            std::lock_guard<std::mutex> lk(g_frame_mtx);
-            g_current_mjpeg_frame = std::move(jpeg_buffer);
-            g_frame_sequence++;
+          std::lock_guard<std::mutex> lk(g_frame_mtx);
+          g_current_mjpeg_frame = std::move(jpeg_buffer);
+          g_frame_sequence++;
         }
         g_frame_cv.notify_all();
+      }
     }
-}
-    //
     cur=next;
     last_rendered_seq_any = any_seq;
     return true;
@@ -3726,53 +3749,55 @@ int main(int argc, char **argv) {
     fprintf(stderr, "[webui] open http://<device-ip>:%d/\n", webui_port);
   }
 
-// ---- OLED background thread ----
-static volatile int g_oled_stop = 0;
-std::thread oled_thr;
-{
-  ssd1306_app_cfg_t ocfg;
-  ssd1306_app_cfg_init(&ocfg);
+  // ---- OLED background thread ----
+  static volatile int g_oled_stop = 0;
+  std::thread oled_thr;
+  {
+    ssd1306_app_cfg_t ocfg;
+    ssd1306_app_cfg_init(&ocfg);
 
-  ocfg.stop_flag = &g_oled_stop;
+    ocfg.stop_flag = &g_oled_stop;
 
-  // Choose mode
-  ocfg.power_meter = 1;
-  ocfg.video_monitor = 0;
-  ocfg.animate = 0;
-  ocfg.test_frame = 0;
+    // Choose mode
+    ocfg.power_meter = 1;
+    ocfg.video_monitor = 0;
+    ocfg.animate = 0;
+    ocfg.test_frame = 0;
 
-  // Hardware (adjust as needed)
-  ocfg.i2c_node_address = 1;
-  snprintf(ocfg.oled_type, sizeof(ocfg.oled_type), "%s", "128x64");
+    // Hardware (adjust as needed)
+    ocfg.i2c_node_address = 1;
+    snprintf(ocfg.oled_type, sizeof(ocfg.oled_type), "%s", "128x64");
 
-  ocfg.ina_bus = 10;
-  ocfg.ina_addr = 0x43;
-  ocfg.ina_period_ms = 5000;
+    ocfg.ina_bus = 10;
+    ocfg.ina_addr = 0x43;
+    ocfg.ina_period_ms = 5000;
 
-  // optional: show more fields / GPS / video devices
-  snprintf(ocfg.fields_arg, sizeof(ocfg.fields_arg), "%s", "psu,load,curr,power,pct,vid,fmt,utc_time,local_time,lat,lon");
-  // 1. Resolve and allocate memory automatically
-  char* resolved = realpath("/dev/v4l/by-path/platform-fe800000.csi-video-index0", NULL);
-  if (resolved) {
-    // 2. Copy the resolved string (e.g., "/dev/video0") to your config
-    snprintf(ocfg.video_devs, sizeof(ocfg.video_devs), "%s", resolved);
-    // 3. Free the memory allocated by realpath
-    free(resolved);
-  } else {
-    snprintf(ocfg.video_devs, sizeof(ocfg.video_devs), "%s", "/dev/video0");
+    // optional: show more fields / GPS / video devices
+    snprintf(ocfg.fields_arg, sizeof(ocfg.fields_arg), "%s", "psu,load,curr,power,pct,vid,fmt,utc_time,local_time,lat,lon");
+    // 1. Resolve and allocate memory automatically
+    char* resolved = realpath("/dev/v4l/by-path/platform-fe800000.csi-video-index0", NULL);
+    if (resolved) {
+      // 2. Copy the resolved string (e.g., "/dev/video0") to your config
+      snprintf(ocfg.video_devs, sizeof(ocfg.video_devs), "%s", resolved);
+      // 3. Free the memory allocated by realpath
+      free(resolved);
+    } else {
+      snprintf(ocfg.video_devs, sizeof(ocfg.video_devs), "%s", "/dev/video0");
+    }
+    snprintf(ocfg.nmea_arg, sizeof(ocfg.nmea_arg), "%s", "/dev/ttyS0,115200,1");
+    snprintf(ocfg.tz_arg, sizeof(ocfg.tz_arg), "%s", "CST6CDT");
+
+    // Logging server inside OLED module
+    ocfg.log_tcp_enable = 1;
+    snprintf(ocfg.log_bind_ip, sizeof(ocfg.log_bind_ip), "%s", "0.0.0.0");
+    ocfg.log_port = 9090;
+
+    fprintf(stderr, "[oled] starting server thread on 0.0.0.0:%d ...\n", ocfg.log_port);
+    oled_thr = std::thread([ocfg]() mutable {
+      (void)ssd1306_app_run(&ocfg);
+    });
+    fprintf(stderr, "[oled] TCP-LOG listening on 0.0.0.0:%d ...\n", ocfg.log_port);
   }
-  snprintf(ocfg.nmea_arg, sizeof(ocfg.nmea_arg), "%s", "/dev/ttyS0,115200,1");
-  snprintf(ocfg.tz_arg, sizeof(ocfg.tz_arg), "%s", "CST6CDT");
-
-  // Logging server inside OLED module
-  ocfg.log_tcp_enable = 1;
-  snprintf(ocfg.log_bind_ip, sizeof(ocfg.log_bind_ip), "%s", "0.0.0.0");
-  ocfg.log_port = 9090;
-
-  oled_thr = std::thread([ocfg]() mutable {
-    (void)ssd1306_app_run(&ocfg);
-  });
-}
 
   while (!g_quit.load()) {
     char ch;

@@ -75,7 +75,9 @@ static inline int nmea_parse_hhmmss(const char* s, int* H, int* M, int* S) {
     int isec = (int)floor(sec + 0.5);
     if (isec < 0) isec = 0;
     if (isec > 59) isec = 59;
-    if (H) *H = h; if (M) *M = m; if (S) *S = isec;
+    if (H) *H = h;
+    if (M) *M = m;
+    if (S) *S = isec;
     return 1;
 }
 
@@ -85,7 +87,9 @@ static inline int nmea_parse_ddmmyy(const char* s, int* Y, int* M, int* D) {
     if (sscanf(s, "%2d%2d%2d", &d, &m, &y) != 3) return 0;
     if (d < 1 || d > 31 || m < 1 || m > 12) return 0;
     int year = (y >= 80) ? (1900 + y) : (2000 + y);
-    if (Y) *Y = year; if (M) *M = m; if (D) *D = d;
+    if (Y) *Y = year;
+    if (M) *M = m;
+    if (D) *D = d;
     return 1;
 }
 
@@ -126,7 +130,8 @@ static inline int nmea_split_fields(char* s, const char* sep, char** out, int ma
 /* sentence parsers (mutate s) */
 static inline unsigned nmea_parse_rmc(char* s, nmea_info_t* info) {
     unsigned updated = 0;
-    char* star = strchr(s, '*'); if (star) *star = '\0';
+    char* star = strchr(s, '*');
+    if (star) *star = '\0';
     char* f[24] = {0};
     int idx = nmea_split_fields(s, ",", f, 24);
     const char* times = (idx > 1) ? f[1] : NULL;
@@ -185,7 +190,8 @@ static inline unsigned nmea_parse_rmc(char* s, nmea_info_t* info) {
 
 static inline unsigned nmea_parse_gga(char* s, nmea_info_t* info) {
     unsigned updated = 0;
-    char* star = strchr(s, '*'); if (star) *star = '\0';
+    char* star = strchr(s, '*');
+    if (star) *star = '\0';
     char* f[20] = {0};
     int idx = nmea_split_fields(s, ",", f, 20);
     const char* times = (idx > 1) ? f[1] : NULL;
@@ -243,7 +249,8 @@ static inline unsigned nmea_parse_gga(char* s, nmea_info_t* info) {
 
 static inline unsigned nmea_parse_gll(char* s, nmea_info_t* info) {
     unsigned updated = 0;
-    char* star = strchr(s, '*'); if (star) *star = '\0';
+    char* star = strchr(s, '*');
+    if (star) *star = '\0';
     char* f[16] = {0};
     int idx = nmea_split_fields(s, ",", f, 16);
     const char* lats  = (idx > 1) ? f[1] : NULL;
@@ -276,7 +283,8 @@ static inline unsigned nmea_parse_gll(char* s, nmea_info_t* info) {
 
 static inline unsigned nmea_parse_zda(char* s, nmea_info_t* info) {
     unsigned updated = 0;
-    char* star = strchr(s, '*'); if (star) *star = '\0';
+    char* star = strchr(s, '*');
+    if (star) *star = '\0';
     char* f[12] = {0};
     int idx = nmea_split_fields(s, ",", f, 12);
     const char* times = (idx > 1) ? f[1] : NULL;

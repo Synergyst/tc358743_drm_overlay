@@ -19,7 +19,8 @@ SRCS := \
     overlay_backend.cpp \
     v4l2_caps.cpp \
     oak_accel.cpp \
-    gpu_clahe.cpp
+    gpu_clahe.cpp \
+    jpeg_encode_fast.cpp
 
 OBJS := $(SRCS:.cpp=.o)
 
@@ -29,6 +30,15 @@ JSON_HPP := $(THIRD_PARTY_DIR)/json.hpp
 
 HTTPLIB_URL := https://raw.githubusercontent.com/yhirose/cpp-httplib/v0.15.3/httplib.h
 JSON_URL := https://raw.githubusercontent.com/nlohmann/json/v3.11.3/single_include/nlohmann/json.hpp
+
+# ---- libjpeg-turbo (TurboJPEG 3.x) vendored build ----
+JPEGTURBO_VER := 3.0.3
+JPEGTURBO_DIR := $(THIRD_PARTY_DIR)/libjpeg-turbo
+JPEGTURBO_BUILD := $(JPEGTURBO_DIR)/build
+JPEGTURBO_PREFIX := $(THIRD_PARTY_DIR)/jpeg-turbo
+JPEGTURBO_INC := $(JPEGTURBO_PREFIX)/include
+JPEGTURBO_LIB := $(JPEGTURBO_PREFIX)/lib
+JPEGTURBO_SO  := $(JPEGTURBO_LIB)/libturbojpeg.so
 
 CXX ?= g++
 CC ?= gcc
@@ -86,6 +96,7 @@ CXXFLAGS += \
     -I$(DEPTHAI_DEPS_INC) \
     -I$(DEPTHAI_THIRD_PARTY_INC) \
     $(PKG_CFLAGS)
+CXXFLAGS += -I./$(JPEGTURBO_INC)
 CXXFLAGS += -I./$(SSD_DIR) -DNMEA_MINI_ENABLE_TZ
 
 CFLAGS ?=
@@ -97,6 +108,7 @@ LDFLAGS += \
     -L$(DEPTHAI_LIB) \
     -L$(DEPTHAI_DEPS_LIB) \
     -Wl,--gc-sections
+LDFLAGS += -L./$(JPEGTURBO_LIB) -Wl,-rpath,'$$ORIGIN/$(JPEGTURBO_LIB)'
 
 LDLIBS ?=
 LDLIBS += \
@@ -108,7 +120,7 @@ LDLIBS += \
     -ludev \
     -lm \
     $(pkg-config --libs libjpeg libturbojpeg) \
-    /usr/lib/aarch64-linux-gnu/libturbojpeg.a \
+    ./$(JPEGTURBO_LIB)/libturbojpeg.a \
     $(DEPTHAI_LIB)/libdepthai-core.a \
     -Wl,--whole-archive $(DEPTHAI_RES_A) -Wl,--no-whole-archive \
     $(DEPTHAI_XLINK_A) \
@@ -122,6 +134,7 @@ LDLIBS += \
     $(DEPTHAI_CRYPTO_A) \
     -pthread \
     $(PKG_LIBS)
+#LDLIBS += -lturbojpeg
 
 # ----- Static options -----
 # FULL static: forces static resolution for *everything*
@@ -142,7 +155,7 @@ all: deps $(TARGET)
 	@echo "[build] built: ./$(TARGET)"
 	strip --strip-unneeded ./$(TARGET)
 
-deps: $(HTTPLIB_H) $(JSON_HPP)
+deps: $(HTTPLIB_H) $(JSON_HPP) $(JPEGTURBO_SO)
 
 $(THIRD_PARTY_DIR):
 	@mkdir -p $(THIRD_PARTY_DIR)
@@ -154,6 +167,25 @@ $(HTTPLIB_H): | $(THIRD_PARTY_DIR)
 $(JSON_HPP): | $(THIRD_PARTY_DIR)
 	@echo "[build] fetching nlohmann/json..."
 	@curl -L --fail -o "$@" "$(JSON_URL)"
+
+$(JPEGTURBO_DIR): | $(THIRD_PARTY_DIR)
+	@echo "[build] fetching libjpeg-turbo $(JPEGTURBO_VER)..."
+	@if [ ! -d "$(JPEGTURBO_DIR)/.git" ]; then \
+		git clone --depth 1 --branch $(JPEGTURBO_VER) https://github.com/libjpeg-turbo/libjpeg-turbo.git "$(JPEGTURBO_DIR)"; \
+	else \
+		echo "[build] libjpeg-turbo already present"; \
+	fi
+
+$(JPEGTURBO_SO): $(JPEGTURBO_DIR)
+	@echo "[build] building libjpeg-turbo..."
+	@mkdir -p "$(JPEGTURBO_BUILD)"
+	@cmake -G Ninja -S "$(JPEGTURBO_DIR)" -B "$(JPEGTURBO_BUILD)" \
+		-DCMAKE_BUILD_TYPE=Release \
+		-DCMAKE_INSTALL_PREFIX="$(abspath $(JPEGTURBO_PREFIX))" \
+		-DENABLE_SHARED=ON -DENABLE_STATIC=ON -DWITH_TURBOJPEG=ON \
+		-DCMAKE_C_FLAGS="-pthread"
+	@ninja -C "$(JPEGTURBO_BUILD)"
+	@ninja -C "$(JPEGTURBO_BUILD)" install
 
 $(TARGET): $(OBJS) $(SSD_OBJS)
 	@echo "[build] linking..."

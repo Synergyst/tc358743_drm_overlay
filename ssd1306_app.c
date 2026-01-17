@@ -710,11 +710,11 @@ static uint8_t meter_update_values_dyn(meter_prev_t* st,
     for (int i = 0; i < vid_count && row < max_rows; ++i) {
       int label_chars = (int)strlen("VID0:");
       ssd1306_oled_set_XY((uint8_t)(label_chars * meter_char_width()), row);
-      ssd1306_oled_write_line(METER_FONT_SIZE, vid_texts[i]);
+      ssd1306_oled_write_line(METER_FONT_SIZE, (char*)vid_texts[i]);
       row++;
       if (row >= max_rows) break;
       ssd1306_oled_set_XY((uint8_t)(label_chars * meter_char_width()), row);
-      ssd1306_oled_write_line(METER_FONT_SIZE, fmt_texts[i]);
+      ssd1306_oled_write_line(METER_FONT_SIZE, (char*)fmt_texts[i]);
       row++;
     }
   } else {

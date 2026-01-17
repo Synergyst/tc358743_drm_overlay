@@ -93,8 +93,8 @@ static uint64_t monotonic_ms() {
   return (uint64_t)ts.tv_sec * 1000ull + (uint64_t)ts.tv_nsec / 1000000ull;
 }
 
-// Sketch of the missing encoder function using libjpeg-turbo
-bool encode_frame_to_jpeg(void* src_map, int w, int h, int pitch, std::vector<uint8_t>& out_jpeg) {
+bool encode_frame_to_jpeg(void* src_map, int w, int h, int pitch, std::vector<uint8_t>& out_jpeg);
+/*bool encode_frame_to_jpeg(void* src_map, int w, int h, int pitch, std::vector<uint8_t>& out_jpeg) {
     if (!src_map) return false;
 
     tjhandle compressor = tjInitCompress();
@@ -117,7 +117,7 @@ bool encode_frame_to_jpeg(void* src_map, int w, int h, int pitch, std::vector<ui
     tjDestroy(compressor);
 
     return (status == 0);
-}
+}*/
 
 // ---------------- raw terminal (q to quit) ----------------
 static struct termios orig_termios;
@@ -3770,7 +3770,7 @@ int main(int argc, char **argv) {
 
     ocfg.ina_bus = 10;
     ocfg.ina_addr = 0x43;
-    ocfg.ina_period_ms = 5000;
+    ocfg.ina_period_ms = 1000;
 
     // optional: show more fields / GPS / video devices
     snprintf(ocfg.fields_arg, sizeof(ocfg.fields_arg), "%s", "psu,load,curr,power,pct,vid,fmt,utc_time,local_time,lat,lon");
@@ -3779,11 +3779,11 @@ int main(int argc, char **argv) {
     if (resolved) {
       // 2. Copy the resolved string (e.g., "/dev/video0") to your config
       snprintf(ocfg.video_devs, sizeof(ocfg.video_devs), "%s", resolved);
-      // 3. Free the memory allocated by realpath
-      free(resolved);
     } else {
       snprintf(ocfg.video_devs, sizeof(ocfg.video_devs), "%s", "/dev/video0");
     }
+    // 3. Free the memory allocated by realpath
+    free(resolved);
     snprintf(ocfg.nmea_arg, sizeof(ocfg.nmea_arg), "%s", "/dev/ttyS0,115200,1");
     snprintf(ocfg.tz_arg, sizeof(ocfg.tz_arg), "%s", "CST6CDT");
 

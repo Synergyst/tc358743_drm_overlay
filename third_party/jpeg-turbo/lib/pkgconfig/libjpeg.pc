@@ -1,0 +1,10 @@
+prefix=/root/drm_overlay_testing/tc358743_drm_overlay/third_party/jpeg-turbo
+exec_prefix=/root/drm_overlay_testing/tc358743_drm_overlay/third_party/jpeg-turbo
+libdir=/root/drm_overlay_testing/tc358743_drm_overlay/third_party/jpeg-turbo/lib
+includedir=/root/drm_overlay_testing/tc358743_drm_overlay/third_party/jpeg-turbo/include
+
+Name: libjpeg
+Description: A SIMD-accelerated JPEG codec that provides the libjpeg API
+Version: 3.0.3
+Libs: -L${libdir} -ljpeg
+Cflags: -I${includedir}

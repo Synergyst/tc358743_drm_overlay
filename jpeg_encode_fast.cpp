@@ -10,7 +10,10 @@ bool encode_frame_to_jpeg(void* src_map, int w, int h, int pitch, std::vector<ui
     if (!compressor) return false;
 
     // These parameters are valid in libturbojpeg 3.0.3
-    tj3Set(compressor, TJPARAM_QUALITY, 33);
+    //tj3Set(compressor, TJPARAM_QUALITY, 9);
+    //tj3Set(compressor, TJPARAM_QUALITY, 18);
+    //tj3Set(compressor, TJPARAM_QUALITY, 68);
+    tj3Set(compressor, TJPARAM_QUALITY, 100);
     tj3Set(compressor, TJPARAM_SUBSAMP, TJSAMP_420);
 
     unsigned char* dest_buf = nullptr;

@@ -6,7 +6,13 @@
 # --v4l2-dev /dev/v4l/by-path/platform-fe800000.csi-video-index0 --v4l2-src /dev/v4l/by-id/usb-IRay_M3Lite-video-index0
 #/root/drm_overlay/tc358743_drm_present_main --config /root/drm_overlay/overlay_config.json --listen 0.0.0.0 --webui-port 8080 --edid /root/drm_overlay/720P60EDID.txt --bgr --v4l2-dev /dev/v4l/by-path/platform-fe801000.csi-video-index0 --v4l2-src /dev/v4l/by-id/usb-IRay_M3Lite-video-index0
 
+#while true ; do
+#  /root/drm_overlay_testing/tc358743_drm_overlay/tc358743_drm_present_main --config /root/drm_overlay_testing/tc358743_drm_overlay/overlay_config.json --listen 0.0.0.0 --webui-port 8080 --edid /root/drm_overlay/720P60EDID.txt --bgr --v4l2-dev /dev/v4l/by-path/platform-fe800000.csi-video-index0 --v4l2-src /dev/v4l/by-path/platform-fe800000.csi-video-index0 /dev/v4l/by-path/platform-fe801000.csi-video-index0
+  #/root/drm_overlay_testing/tc358743_drm_overlay/tc358743_drm_present_main --config /root/drm_overlay_testing/tc358743_drm_overlay/overlay_config.json --listen 0.0.0.0 --webui-port 8080 --edid /root/drm_overlay/720P60EDID.txt --bgr --v4l2-dev /dev/v4l/by-path/platform-fe801000.csi-video-index0 --v4l2-src /dev/v4l/by-path/platform-fe801000.csi-video-index0
+#  sleep 3
+#done
+
 while true ; do
-  /root/drm_overlay_testing/tc358743_drm_overlay/tc358743_drm_present_main --config /root/drm_overlay_testing/tc358743_drm_overlay/overlay_config.json --listen 0.0.0.0 --webui-port 8080 --edid /root/drm_overlay/720P60EDID.txt --bgr --v4l2-dev /dev/v4l/by-path/platform-fe800000.csi-video-index0 --v4l2-src /dev/v4l/by-path/platform-fe800000.csi-video-index0
+  /root/drm_overlay_testing/tc358743_drm_overlay/tc358743_drm_present_main --present fit --threads 7 --config /root/drm_overlay_testing/tc358743_drm_overlay/overlay_config.json --listen 0.0.0.0 --webui-port 8080 --edid /root/drm_overlay/720P60EDID.txt --bgr
   sleep 3
 done

@@ -3684,7 +3684,7 @@ int main(int argc, char **argv) {
   pipeline p;
   bool have_pipeline=false;
   uint8_t restartCount = 0;
-  uint8_t restartMaxCount = 3;
+  uint8_t restartMaxCount = 5;
   for (;;) {
     auto snap=cfg_snapshot();
     {
@@ -3694,12 +3694,13 @@ int main(int argc, char **argv) {
     if (!present_policy_valid(snap.present_policy)) snap.present_policy="fit";
     if (p.init_from_config(snap)) { have_pipeline=true; break; }
     if (restartCount < restartMaxCount) {
-      fprintf(stderr, "[supervisor] pipeline init failed; retrying in 1s...\n");
+      fprintf(stderr, "[supervisor] pipeline init failed (pre-start); retrying in 1s...\n");
     } else {
-      fprintf(stderr, "[supervisor] pipeline init failed; rebooting...\n");
+      fprintf(stderr, "[supervisor] pipeline init failed (pre-start); rebooting...\n");
       p.shutdown();
       usleep(1000*1000);
-      system("nohup reboot &");
+      exit(1);
+      //system("nohup reboot &");
       break;
     }
     restartCount++;
@@ -3775,7 +3776,7 @@ int main(int argc, char **argv) {
     // optional: show more fields / GPS / video devices
     snprintf(ocfg.fields_arg, sizeof(ocfg.fields_arg), "%s", "psu,load,curr,power,pct,vid,fmt,utc_time,local_time,lat,lon");
     // 1. Resolve and allocate memory automatically
-    char* resolved = realpath("/dev/v4l/by-path/platform-fe800000.csi-video-index0", NULL);
+    char* resolved = realpath("/dev/v4l/by-path/platform-fe801000.csi-video-index0", NULL);
     if (resolved) {
       // 2. Copy the resolved string (e.g., "/dev/video0") to your config
       snprintf(ocfg.video_devs, sizeof(ocfg.video_devs), "%s", resolved);
@@ -3809,12 +3810,13 @@ int main(int argc, char **argv) {
       if (!present_policy_valid(snap.present_policy)) snap.present_policy="fit";
       if (!p.init_from_config(snap)) {
         if (restartCount < restartMaxCount) {
-          fprintf(stderr, "[supervisor] pipeline init failed; retrying in 1s...\n");
+          fprintf(stderr, "[supervisor] pipeline init failed (post-start); retrying in 1s...\n");
         } else {
-          fprintf(stderr, "[supervisor] pipeline init failed; rebooting...\n");
+          fprintf(stderr, "[supervisor] pipeline init failed (post-start); rebooting...\n");
           p.shutdown(); have_pipeline=false;
           usleep(1000*1000);
-          system("nohup reboot &");
+          exit(1);
+          //system("nohup reboot &");
         }
         restartCount++;
         //fprintf(stderr, "[supervisor] pipeline init failed; retrying in 1s...\n");
